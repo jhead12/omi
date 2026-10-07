@@ -1,10 +1,10 @@
 import 'package:flutter/material.dart';
-import 'package:omi/backend/auth.dart';
+
 import 'package:omi/backend/preferences.dart';
-import 'package:gradient_borders/gradient_borders.dart';
-import 'package:intercom_flutter/intercom_flutter.dart';
-import 'package:omi/providers/home_provider.dart';
-import 'package:provider/provider.dart';
+import 'package:omi/services/auth_service.dart';
+import 'package:omi/pages/onboarding/widgets/onboarding_card.dart';
+import 'package:omi/ui/ui.dart';
+import 'package:omi/utils/l10n_extensions.dart';
 
 class NameWidget extends StatefulWidget {
   final Function goNext;
@@ -22,103 +22,74 @@ class _NameWidgetState extends State<NameWidget> {
   @override
   void initState() {
     nameController = TextEditingController(text: SharedPreferencesUtil().givenName);
-    // focusNode.requestFocus();
     super.initState();
+
+    // Auto-focus the name input field after the widget is built
+    // WidgetsBinding.instance.addPostFrameCallback((_) {
+    //   focusNode.requestFocus();
+    // });
   }
 
+  @override
+  void dispose() {
+    nameController.dispose();
+    focusNode.dispose();
+    super.dispose();
+  }
+
+  bool get _canContinue => nameController.text.trim().isNotEmpty;
+
+  void _submit() {
+    if (!_canContinue) return;
+    FocusManager.instance.primaryFocus?.unfocus();
+    AuthService.instance.updateGivenName(nameController.text.trim());
+    OmiHaptics.selection();
+    widget.goNext();
+  }
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16),
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.end,
-        crossAxisAlignment: CrossAxisAlignment.center,
-        children: [
-          Text(
-            'How should Omi call you?',
-            style: TextStyle(color: Colors.grey.shade300, fontSize: 16),
-            textAlign: TextAlign.start,
+    return OnboardingStep(
+      card: OnboardingCard(
+        content: [
+          Semantics(
+            header: true,
+            child: Text(context.l10n.whatsYourName, style: OmiType.title1, textAlign: TextAlign.center),
           ),
-          const SizedBox(height: 24),
-          TextField(
-            enabled: true,
-            focusNode: focusNode,
-            controller: nameController,
-            obscureText: false,
-            textAlign: TextAlign.center,
-            textAlignVertical: TextAlignVertical.center,
-            decoration: InputDecoration(
-              hintText: 'How Omi should call you?',
-              hintStyle: const TextStyle(fontSize: 14, color: Colors.grey),
-              border: GradientOutlineInputBorder(
-                borderRadius: BorderRadius.circular(8),
-                gradient: const LinearGradient(
-                  colors: <Color>[
-                    Color.fromARGB(255, 202, 201, 201),
-                    Color.fromARGB(255, 159, 158, 158),
-                  ],
-                ),
-              ),
+          const SizedBox(height: OmiSpacing.xxl),
+          Container(
+            decoration: BoxDecoration(
+              color: OmiColors.surface1,
+              borderRadius: OmiRadius.lgAll,
+              border: Border.all(color: OmiColors.border),
             ),
-            style: TextStyle(fontSize: 16, color: Colors.grey.shade200),
-          ),
-          const SizedBox(height: 20),
-          Row(
-            children: [
-              Expanded(
-                child: Container(
-                  width: double.infinity,
-                  decoration: BoxDecoration(
-                    border: const GradientBoxBorder(
-                      gradient: LinearGradient(colors: [
-                        Color.fromARGB(127, 208, 208, 208),
-                        Color.fromARGB(127, 188, 99, 121),
-                        Color.fromARGB(127, 86, 101, 182),
-                        Color.fromARGB(127, 126, 190, 236)
-                      ]),
-                      width: 2,
-                    ),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: MaterialButton(
-                    padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
-                    onPressed: () async {
-                      if (nameController.text.isEmpty || nameController.text.trim().isEmpty) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text('Please enter a valid name')),
-                        );
-                      } else {
-                        FocusManager.instance.primaryFocus?.unfocus();
-                        updateGivenName(nameController.text);
-                        widget.goNext();
-                      }
-                    },
-                    child: const Text(
-                      'Continue',
-                      style: TextStyle(
-                        decoration: TextDecoration.none,
-                      ),
-                    ),
-                  ),
-                ),
-              )
-            ],
-          ),
-          const SizedBox(
-            height: 12,
-          ),
-          InkWell(
-            child: Text(
-              'Need Help?',
-              style: TextStyle(
-                color: Colors.grey.shade300,
-                decoration: TextDecoration.underline,
+            child: TextField(
+              controller: nameController,
+              focusNode: focusNode,
+              style: OmiType.body.copyWith(fontWeight: FontWeight.w500),
+              textAlign: TextAlign.center,
+              textCapitalization: TextCapitalization.words,
+              textInputAction: TextInputAction.done,
+              onSubmitted: (_) => _submit(),
+              decoration: InputDecoration(
+                hintText: context.l10n.enterYourName,
+                hintStyle: OmiType.body.copyWith(color: OmiColors.textTertiary),
+                border: InputBorder.none,
+                contentPadding: const EdgeInsets.symmetric(horizontal: OmiSpacing.xl, vertical: OmiSpacing.lg),
               ),
+              onChanged: (value) {
+                setState(() {}); // Trigger rebuild to update button state
+              },
             ),
-            onTap: () {
-              Intercom.instance.displayMessenger();
-            },
+          ),
+        ],
+        footer: [
+          const SizedBox(height: OmiSpacing.xxl),
+          OmiButton(
+            key: const Key('onboarding_name_continue'),
+            label: context.l10n.continueButton,
+            expand: true,
+            onPressed: _canContinue ? _submit : null,
           ),
         ],
       ),

@@ -1,5 +1,6 @@
 /* eslint-disable prettier/prettier */
 import { Brain, Cpu, Bell, Plug2, MessageSquare, Info } from 'lucide-react';
+import Image from 'next/image';
 import { cn } from '@/src/lib/utils';
 import type { Plugin } from '../types';
 
@@ -45,10 +46,12 @@ export function AppHeader({ plugin }: AppHeaderProps) {
       <div className="flex items-start space-x-8">
         <div className="group relative">
           <div className="absolute -inset-4 rounded-2xl bg-white/5 opacity-0 transition-all duration-300 group-hover:opacity-100" />
-          <img
+          <Image
             src={plugin.image}
             alt={plugin.name}
             className="relative h-32 w-32 rounded-2xl object-cover shadow-xl transition-transform duration-300 group-hover:scale-105"
+            width={128}
+            height={128}
           />
         </div>
         <div>
@@ -78,21 +81,33 @@ export function AppHeader({ plugin }: AppHeaderProps) {
           {/* Store Buttons */}
           <div className="mt-6 flex items-center gap-4">
             <a
-              href="https://apps.apple.com/app/id123456789"
+              href="https://apps.apple.com/us/app/friend-ai-wearable/id6502156163"
               target="_blank"
               rel="noopener noreferrer"
               className="flex h-10 items-center gap-2 rounded-lg bg-[#1A1F2E] px-4 py-2 text-sm font-medium text-white transition-all hover:bg-[#242938]"
             >
-              <img src="/app-store.svg" alt="App Store" className="h-5 w-5" />
+              <Image
+                src="/app-store.svg"
+                alt="App Store"
+                className="h-5 w-5"
+                width={20}
+                height={20}
+              />
               <span>App Store</span>
             </a>
             <a
-              href="https://play.google.com/store/apps/details?id=com.omi.app"
+              href="https://play.google.com/store/apps/details?id=com.friend.ios"
               target="_blank"
               rel="noopener noreferrer"
               className="flex h-10 items-center gap-2 rounded-lg bg-[#1A1F2E] px-4 py-2 text-sm font-medium text-white transition-all hover:bg-[#242938]"
             >
-              <img src="/play-store.svg" alt="Play Store" className="h-5 w-5" />
+              <Image
+                src="/play-store.svg"
+                alt="Play Store"
+                className="h-5 w-5"
+                width={20}
+                height={20}
+              />
               <span>Play Store</span>
             </a>
           </div>
@@ -100,4 +115,4 @@ export function AppHeader({ plugin }: AppHeaderProps) {
       </div>
     </div>
   );
-} 
+}

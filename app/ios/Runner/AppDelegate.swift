@@ -2,40 +2,626 @@ import UIKit
 import Flutter
 import UserNotifications
 import app_links
+import WatchConnectivity
+import AVFoundation
+import Speech
+import WidgetKit
+import BackgroundTasks
+
+extension FlutterError: Error {}
+// MARK: - Quick Actions Icon Patcher
+
+/// Observes UIApplication.shortcutItems via KVO and replaces template-image icons
+/// (set by the quick_actions Flutter plugin) with native SF Symbol icons.
+final class QuickActionsIconPatcher: NSObject {
+
+    static let shared = QuickActionsIconPatcher()
+    private var isObserving = false
+
+    private let symbolMap: [String: String] = [
+        "add_task":        "checkmark.circle.fill",
+        "ask_omi":         "message.fill",
+        "voice_mode":      "waveform",
+        "mute":            "mic.slash.fill",
+        "unmute":          "mic.fill",
+        "connect_device":  "cable.connector.horizontal",
+        "device_settings": "slider.horizontal.3",
+    ]
+
+    func startObserving() {
+        guard !isObserving else { return }
+        UIApplication.shared.addObserver(
+            self,
+            forKeyPath: #keyPath(UIApplication.shortcutItems),
+            options: [.new],
+            context: nil
+        )
+        isObserving = true
+    }
+
+    func stopObserving() {
+        guard isObserving else { return }
+        UIApplication.shared.removeObserver(self, forKeyPath: #keyPath(UIApplication.shortcutItems))
+        isObserving = false
+    }
+
+    override func observeValue(
+        forKeyPath keyPath: String?,
+        of object: Any?,
+        change: [NSKeyValueChangeKey: Any]?,
+        context: UnsafeMutableRawPointer?
+    ) {
+        guard keyPath == #keyPath(UIApplication.shortcutItems) else { return }
+        DispatchQueue.main.async { self.patchIcons() }
+    }
+
+    private func patchIcons() {
+        guard let items = UIApplication.shared.shortcutItems, !items.isEmpty else { return }
+
+        let patched = items.map { item -> UIApplicationShortcutItem in
+            guard let symbol = symbolMap[item.type] else { return item }
+            let icon = UIApplicationShortcutIcon(systemImageName: symbol)
+            return UIApplicationShortcutItem(
+                type: item.type,
+                localizedTitle: item.localizedTitle,
+                localizedSubtitle: item.localizedSubtitle,
+                icon: icon,
+                userInfo: item.userInfo
+            )
+        }
+
+        // Stop observing before setting to avoid infinite KVO loop.
+        stopObserving()
+        UIApplication.shared.shortcutItems = patched
+        startObserving()
+    }
+
+    deinit { stopObserving() }
+}
 
 @main
-@objc class AppDelegate: FlutterAppDelegate {
+@objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
+  private var liveActivityManager: Any?
+  private static let unusedForegroundTaskRefreshIdentifier = "com.pravera.flutter_foreground_task.refresh"
   private var methodChannel: FlutterMethodChannel?
-
+  private var capturePolicyChannel: FlutterMethodChannel?
+  private var syncTransferChannel: FlutterMethodChannel?
+  private var ttsMp3DecoderChannel: FlutterMethodChannel?
+  private var ttsPcmPlayerChannel: FlutterMethodChannel?
+  private let ttsPcmPlayer = TtsPcmPlayer()
+  private var syncTransferBackgroundTask: UIBackgroundTaskIdentifier = .invalid
+  private lazy var syncTransferLease = SyncTransferBackgroundLease(
+      begin: { [weak self] expirationHandler in
+          guard let self else { return false }
+          self.syncTransferBackgroundTask = UIApplication.shared.beginBackgroundTask(
+              withName: "omi-live-capture-wal-drain",
+              expirationHandler: expirationHandler
+          )
+          return self.syncTransferBackgroundTask != .invalid
+      },
+      end: { [weak self] in
+          self?.endNativeSyncTransferBackgroundTask()
+      },
+      notifyExpired: { [weak self] reason in
+          self?.syncTransferChannel?.invokeMethod("expired", arguments: ["reason": reason])
+      }
+  )
+  private var appleRemindersChannel: FlutterMethodChannel?
+  private var appleHealthChannel: FlutterMethodChannel?
+  private let appleRemindersService = AppleRemindersService()
+  private let appleHealthService = AppleHealthService()
+  private var deviceToolsChannel: FlutterMethodChannel?
+  private let deviceToolsService = DeviceToolsService()
+  private var phoneMicController: PhoneMicController?
   private var notificationTitleOnKill: String?
   private var notificationBodyOnKill: String?
+
+  var session: WCSession?
+    var flutterWatchAPI: WatchRecorderFlutterAPI?
+    var rayBanMetaHostApi: RayBanMetaHostApiImpl?
+  private var audioChunks: [Int: (Data, Double)] = [:] // (audioData, sampleRate)
+  private var nextExpectedChunkIndex: Int = 0
+  private var isRecordingActive: Bool = false // Track recording state to handle app restarts
+
+  private static let periodicSyncIdentifier = "com.omi.recording-sync.refresh"
+  private var periodicSyncChannel: FlutterMethodChannel?
+  private var periodicSyncReady = false
+
+  private func schedulePeriodicSync() {
+    let request = BGAppRefreshTaskRequest(identifier: Self.periodicSyncIdentifier)
+    // Earliest eligibility only. iOS decides whether and when to grant a window.
+    request.earliestBeginDate = Date(timeIntervalSinceNow: 60 * 60)
+    do {
+      try BGTaskScheduler.shared.submit(request)
+    } catch {
+      NSLog("[PeriodicSync] scheduling unavailable: %@", String(describing: error))
+    }
+  }
+
+  private func runPeriodicSync(_ task: BGTask) {
+    schedulePeriodicSync()
+    guard periodicSyncReady, let channel = periodicSyncChannel else {
+      // TODO(astra): WAL recovery is configured by the UI-isolate SyncProvider. (#5491)
+      // There is no isolated headless WAL/account bootstrap. Do not boot the
+      // ordinary app entrypoint here: it can start capture. Suspended-engine
+      // refresh is supported; a cold-process grant safely waits for foreground.
+      task.setTaskCompleted(success: false)
+      return
+    }
+    var completed = false
+    func finish(_ success: Bool) {
+      guard !completed else { return }
+      completed = true
+      task.expirationHandler = nil
+      task.setTaskCompleted(success: success)
+    }
+    task.expirationHandler = {
+      DispatchQueue.main.async {
+        guard !completed else { return }
+        channel.invokeMethod("expire", arguments: nil)
+        finish(false)
+      }
+    }
+    channel.invokeMethod("wake", arguments: nil) { result in
+      finish((result as? Bool) == true)
+    }
+  }
 
   override func application(
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
-    GeneratedPluginRegistrant.register(with: self)
-
-      // Retrieve the link from parameters
-    if let url = AppLinks.shared.getLink(launchOptions: launchOptions) {
-      // We have a link, propagate it to your Flutter app or not
-      AppLinks.shared.handleLink(url: url)
-      return true // Returning true will stop the propagation to other packages
+    BGTaskScheduler.shared.register(forTaskWithIdentifier: Self.periodicSyncIdentifier, using: .main) { [weak self] task in
+      guard let self = self else {
+        task.setTaskCompleted(success: false)
+        return
+      }
+      self.runPeriodicSync(task)
     }
+    QuickActionsIconPatcher.shared.startObserving()
+    SwiftFlutterForegroundTaskPlugin.setPluginRegistrantCallback { registry in
+      GeneratedPluginRegistrant.register(with: registry)
+    }
+    UNUserNotificationCenter.current().delegate = self as? UNUserNotificationCenterDelegate
+    let launched = super.application(application, didFinishLaunchingWithOptions: launchOptions)
+    SiriBridge.shared.installNativeAuthFence()
+    SiriBridge.shared.retryPendingWipeOnLaunch()
+    BGTaskScheduler.shared.cancel(
+      taskRequestWithIdentifier: AppDelegate.unusedForegroundTaskRefreshIdentifier
+    )
+    if let url = AppLinks.shared.getLink(launchOptions: launchOptions) {
+      AppLinks.shared.handleLink(url: url)
+      return true
+    }
+    return launched
+  }
+
+  func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
+    GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
+    let messenger = engineBridge.applicationRegistrar.messenger()
+    let syncChannel = FlutterMethodChannel(name: "com.omi/periodic_recording_sync", binaryMessenger: messenger)
+    periodicSyncChannel = syncChannel
+    syncChannel.setMethodCallHandler { [weak self] call, result in
+      guard call.method == "schedule", let self = self else {
+        result(FlutterMethodNotImplemented)
+        return
+      }
+      self.periodicSyncReady = true
+      self.schedulePeriodicSync()
+      result(nil)
+    }
+    SiriBridge.shared.attach(messenger: messenger)
+    if #available(iOS 16.1, *) {
+      liveActivityManager = LiveActivityManager(messenger: messenger)
+    }
+    #if compiler(>=6.4)
+    if #available(iOS 16.0, *),
+       let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "OmiShortcutsButton") {
+      registrar.register(OmiShortcutsButtonFactory(), withId: "omi/shortcuts_button")
+    }
+    #endif
+
+    ttsMp3DecoderChannel = FlutterMethodChannel(
+      name: "com.omi/tts_mp3_decoder",
+      binaryMessenger: messenger
+    )
+    ttsMp3DecoderChannel?.setMethodCallHandler { call, result in
+      guard call.method == "decode",
+            let args = call.arguments as? [String: Any],
+            let typedData = args["bytes"] as? FlutterStandardTypedData else {
+        result(FlutterError(code: "invalid_mp3", message: "decode requires MP3 bytes", details: nil))
+        return
+      }
+      DispatchQueue.global(qos: .userInitiated).async {
+        var channels: Int32 = 0
+        var sampleRate: Int32 = 0
+        var samplesPerChannel: Int32 = 0
+        var pcm: UnsafeMutablePointer<Int16>?
+        let status = typedData.data.withUnsafeBytes { rawBuffer -> Int32 in
+          guard let base = rawBuffer.bindMemory(to: UInt8.self).baseAddress else { return 1 }
+          return omi_decode_mp3(
+            base,
+            Int32(typedData.data.count),
+            &channels,
+            &sampleRate,
+            &samplesPerChannel,
+            &pcm
+          )
+        }
+        guard status == 0, let pcm else {
+          DispatchQueue.main.async {
+            result(FlutterError(
+              code: "decode_failed",
+              message: "MP3 prefix has no complete audio frame",
+              details: nil
+            ))
+          }
+          return
+        }
+        let byteCount = Int(samplesPerChannel * channels) * MemoryLayout<Int16>.size
+        let output = Data(bytes: pcm, count: byteCount)
+        omi_free_decoded_audio(pcm)
+        DispatchQueue.main.async {
+          result([
+            "channels": channels,
+            "sample_rate": sampleRate,
+            "pcm": FlutterStandardTypedData(bytes: output)
+          ])
+        }
+      }
+    }
+    ttsPcmPlayerChannel = FlutterMethodChannel(
+      name: "com.omi/tts_pcm_player",
+      binaryMessenger: messenger
+    )
+    ttsPcmPlayerChannel?.setMethodCallHandler { [weak self] call, result in
+      self?.ttsPcmPlayer.handle(call, result: result)
+    }
+
+    // Read-only admission evidence for the separately signed capture lane.
+    // Missing flags stay nil so Dart fails closed before app-owned networking.
+    FlutterMethodChannel(name: "omi/physical_qualification", binaryMessenger: messenger)
+      .setMethodCallHandler { call, result in
+        guard call.method == "isolation" else {
+          result(FlutterMethodNotImplemented)
+          return
+        }
+        let info = Bundle.main.infoDictionary ?? [:]
+        result([
+          "bundle_id": Bundle.main.bundleIdentifier ?? "",
+          "firebase_messaging_auto_init": info["FirebaseMessagingAutoInitEnabled"] ?? NSNull(),
+          "firebase_crashlytics_collection": info["FirebaseCrashlyticsCollectionEnabled"] ?? NSNull(),
+          "firebase_data_collection": info["FirebaseDataCollectionDefaultEnabled"] ?? NSNull()
+        ])
+      }
+
+      
+      
+      if WCSession.isSupported() {
+          let watchSession = WCSession.default
+          session = watchSession
+          watchSession.delegate = self
+          watchSession.activate()
+
+            flutterWatchAPI = WatchRecorderFlutterAPI(binaryMessenger: messenger)
+            let api: WatchRecorderHostAPI = RecorderHostApiImpl(session: watchSession, flutterWatchAPI: flutterWatchAPI)
+
+            WatchRecorderHostAPISetup.setUp(binaryMessenger: messenger, api: api)
+      }
+
+      // Native BLE module — register Pigeon APIs
+      NSLog("[OmiBle] Registering BLE Pigeon APIs")
+      do {
+          let messenger = messenger
+          let bleFlutterApi = BleFlutterApi(binaryMessenger: messenger)
+          OmiBleManager.shared.setFlutterApi(bleFlutterApi)
+          let bleHostApi = BleHostApiImpl(bleManager: OmiBleManager.shared)
+          BleHostApiSetup.setUp(binaryMessenger: messenger, api: bleHostApi)
+          NSLog("[OmiBle] BLE Pigeon APIs registered successfully")
+      }
+
+      // Ray-Ban Meta (Meta Wearables DAT camera + Bluetooth HFP mic) — Pigeon APIs.
+      // Registered unconditionally; the impl reports availability mode based on
+      // whether the DAT SDK is linked into this build.
+      do {
+          let messenger = messenger
+          let rayBanFlutterApi = RayBanMetaFlutterAPI(binaryMessenger: messenger)
+          let rayBanApi = RayBanMetaHostApiImpl(flutterAPI: rayBanFlutterApi)
+          rayBanMetaHostApi = rayBanApi
+          RayBanMetaHostAPISetup.setUp(binaryMessenger: messenger, api: rayBanApi)
+      }
+
+      // Native phone-mic capture (conversation recording) — Pigeon APIs.
+      // Self-healing AVAudioEngine capture; interruption/route recovery is
+      // handled natively, Dart only mirrors the state.
+      do {
+          let messenger = messenger
+          let phoneMicFlutterApi = PhoneMicFlutterApi(binaryMessenger: messenger)
+          let micController = PhoneMicController(
+              environment: PhoneMicLiveEnvironment.make(sink: phoneMicFlutterApi))
+          phoneMicController = micController
+          PhoneMicHostApiSetup.setUp(binaryMessenger: messenger, api: PhoneMicHostApiImpl(controller: micController))
+      }
+
+      // Native capture admission latch. Mute is applied before Dart persists
+      // its preference; unmute is released only after the durable canonical
+      // preference matches the requested revision.
+      capturePolicyChannel = FlutterMethodChannel(
+          name: "com.omi/capture_policy",
+          binaryMessenger: messenger
+      )
+      capturePolicyChannel?.setMethodCallHandler { call, result in
+          if call.method == "getRevision" {
+              result(CaptureAdmissionPolicy.currentProcessRevision())
+              return
+          }
+          guard call.method == "setMuted" else {
+              result(FlutterMethodNotImplemented)
+              return
+          }
+          guard let args = call.arguments as? [String: Any],
+                let muted = args["muted"] as? Bool,
+                let revision = CaptureAdmissionPolicy.channelRevision(args["revision"]),
+                revision >= 0 else {
+              result(FlutterError(
+                  code: "INVALID_CAPTURE_POLICY",
+                  message: "setMuted requires {muted: bool, revision: nonnegative int}",
+                  details: nil
+              ))
+              return
+          }
+
+          switch CaptureAdmissionPolicy.applyProcessUpdate(
+              muted: muted,
+              revision: revision,
+              defaults: .standard
+          ) {
+          case .applied:
+              // This acknowledges the process latch only. It deliberately
+              // does not wait for BLE/audio queue drains.
+              result(nil)
+          case let .stale(currentRevision):
+              result(FlutterError(
+                  code: "STALE_CAPTURE_POLICY",
+                  message: "capture policy revision is older than native state",
+                  details: ["currentRevision": currentRevision]
+              ))
+          case .persistenceNotReady:
+              result(FlutterError(
+                  code: "CAPTURE_POLICY_NOT_PERSISTED",
+                  message: "unmute requires the matching durable capture policy",
+                  details: nil
+              ))
+          }
+      }
+
+      // A live-capture WAL drain gets only iOS's bounded background execution
+      // window. Dart limits background work to bounded phone-local drain passes
+      // and releases this lease when the pass finishes.
+      syncTransferChannel = FlutterMethodChannel(
+          name: "com.friend.ios/sync_transfer",
+          binaryMessenger: messenger
+      )
+      syncTransferChannel?.setMethodCallHandler { [weak self] call, result in
+          guard let self else {
+              result(nil)
+              return
+          }
+          switch call.method {
+          case "start":
+              self.syncTransferLease.start()
+              result(nil)
+          case "stop":
+              self.syncTransferLease.stop()
+              result(nil)
+          default:
+              result(FlutterMethodNotImplemented)
+          }
+      }
+
     //Creates a method channel to handle notifications on kill
-    let controller = window?.rootViewController as? FlutterViewController
-    methodChannel = FlutterMethodChannel(name: "com.friend.ios/notifyOnKill", binaryMessenger: controller!.binaryMessenger)
+    methodChannel = FlutterMethodChannel(name: "com.friend.ios/notifyOnKill", binaryMessenger: messenger)
     methodChannel?.setMethodCallHandler { [weak self] (call, result) in
       self?.handleMethodCall(call, result: result)
     }
-
-    // here, Without this code the task will not work.
-    SwiftFlutterForegroundTaskPlugin.setPluginRegistrantCallback(registerPlugins)
-    if #available(iOS 10.0, *) {
-      UNUserNotificationCenter.current().delegate = self as? UNUserNotificationCenterDelegate
+    
+    // Create Apple Reminders method channel
+    appleRemindersChannel = FlutterMethodChannel(name: "com.omi.apple_reminders", binaryMessenger: messenger)
+    appleRemindersChannel?.setMethodCallHandler { [weak self] (call, result) in
+      self?.handleAppleRemindersCall(call, result: result)
     }
 
-    return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+    // Create Apple Health method channel
+    appleHealthChannel = FlutterMethodChannel(name: "com.omi.apple_health", binaryMessenger: messenger)
+    appleHealthChannel?.setMethodCallHandler { [weak self] (call, result) in
+      self?.handleAppleHealthCall(call, result: result)
+    }
+
+    // Create the on-device tool surface method channel
+    deviceToolsChannel = FlutterMethodChannel(name: "com.omi.device_tools", binaryMessenger: messenger)
+    deviceToolsChannel?.setMethodCallHandler { [weak self] (call, result) in
+      self?.deviceToolsService.handleMethodCall(call, result: result)
+    }
+
+    // Create Speech Recognition method channel
+    let speechChannel = FlutterMethodChannel(name: "com.omi.ios/speech", binaryMessenger: messenger)
+    let speechHandler = SpeechRecognitionHandler()
+    speechChannel.setMethodCallHandler { (call, result) in
+        speechHandler.handle(call, result: result)
+    }
+
+    // TestFlight environment detection
+    let envChannel = FlutterMethodChannel(name: "com.omi/environment", binaryMessenger: messenger)
+    envChannel.setMethodCallHandler { (call, result) in
+        if call.method == "isTestFlight" {
+            let isTestFlight = Bundle.main.appStoreReceiptURL?.lastPathComponent == "sandboxReceipt"
+            result(isTestFlight)
+        } else {
+            result(FlutterMethodNotImplemented)
+        }
+    }
+
+    // Audio session configuration for Bluetooth microphone support
+    let audioSessionChannel = FlutterMethodChannel(name: "com.omi.ios/audioSession", binaryMessenger: messenger)
+    audioSessionChannel.setMethodCallHandler { (call, result) in
+        if call.method == "configureForBluetooth" {
+            let audioSession = AVAudioSession.sharedInstance()
+            do {
+                try audioSession.setCategory(
+                    .playAndRecord,
+                    mode: .default,
+                    options: [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker]
+                )
+                try audioSession.setActive(true)
+                result(true)
+            } catch {
+                result(FlutterError(code: "AUDIO_SESSION_ERROR", message: error.localizedDescription, details: nil))
+            }
+        } else {
+            result(FlutterMethodNotImplemented)
+        }
+    }
+
+    // Battery widget channel — writes Omi device battery to the shared App Group
+    // so the WidgetKit extension can read it.
+    let batteryWidgetChannel = FlutterMethodChannel(name: "com.omi.battery_widget", binaryMessenger: messenger)
+    batteryWidgetChannel.setMethodCallHandler { (call, result) in
+      let defaults = UserDefaults(suiteName: "group.com.friend-app-with-wearable.ios12")
+      guard let args = call.arguments as? [String: Any] else {
+        result(FlutterMethodNotImplemented)
+        return
+      }
+      switch call.method {
+      case "updateBatteryInfo":
+        defaults.map { try? SafeDefaults.store(.string(args["deviceName"] as? String ?? "Omi"), forKey: "widget_device_name", in: $0) }
+        defaults.map { try? SafeDefaults.store(.int(args["batteryLevel"] as? Int ?? -1), forKey: "widget_battery_level", in: $0) }
+        defaults.map { try? SafeDefaults.store(.string(args["deviceType"] as? String ?? "omi"), forKey: "widget_device_type", in: $0) }
+        defaults.map { try? SafeDefaults.store(.bool(args["isConnected"] as? Bool ?? false), forKey: "widget_is_connected", in: $0) }
+        defaults.map { try? SafeDefaults.store(.date(Date()), forKey: "widget_last_updated", in: $0) }
+        // NOTE: isMuted is intentionally NOT written here — only updateMuteState controls it
+        if #available(iOS 14.0, *) {
+          WidgetCenter.shared.reloadTimelines(ofKind: "OmiBatteryWidget")
+        }
+      case "updateChargingState":
+        let isCharging = (args["isCharging"] as? Bool) ?? (args["isCharging"] as? NSNumber)?.boolValue ?? false
+        defaults.map { try? SafeDefaults.store(.bool(isCharging), forKey: "widget_is_charging", in: $0) }
+        if #available(iOS 14.0, *) {
+          WidgetCenter.shared.reloadTimelines(ofKind: "OmiBatteryWidget")
+        }
+      case "updateMuteState":
+        let isMuted = (args["isMuted"] as? Bool) ?? (args["isMuted"] as? NSNumber)?.boolValue ?? false
+        defaults.map { try? SafeDefaults.store(.bool(isMuted), forKey: "widget_is_muted", in: $0) }
+        if #available(iOS 14.0, *) {
+          WidgetCenter.shared.reloadAllTimelines()
+        }
+      case "updateWidgetData":
+        // A JSON document for a Home Screen widget (Devices, Up next, Latest); a missing one clears it.
+        let kinds = [
+          "widget_devices": "OmiBatteryWidget",
+          "widget_up_next": "OmiUpNextWidget",
+          "widget_latest": "OmiLatestWidget",
+        ]
+        guard let key = args["key"] as? String, let kind = kinds[key] else {
+          result(FlutterError(code: "UNKNOWN_WIDGET_KEY", message: "No widget reads this key", details: args["key"]))
+          return
+        }
+        if let json = args["json"] as? String {
+          defaults.map { try? SafeDefaults.store(.string(json), forKey: key, in: $0) }
+        } else {
+          defaults?.removeObject(forKey: key)
+        }
+        if #available(iOS 14.0, *) {
+          WidgetCenter.shared.reloadTimelines(ofKind: kind)
+        }
+      default:
+        result(FlutterMethodNotImplemented)
+        return
+      }
+      result(nil)
+    }
+
+    // Register Phone Calls plugin
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "OmiPhoneCallsPlugin") {
+      OmiPhoneCallsPlugin.register(with: registrar)
+    } else {
+      NSLog("[AppDelegate] Phone calls plugin registrar unavailable")
+    }
+  }
+
+  private func endNativeSyncTransferBackgroundTask() {
+    guard syncTransferBackgroundTask != .invalid else { return }
+    let task = syncTransferBackgroundTask
+    syncTransferBackgroundTask = .invalid
+    UIApplication.shared.endBackgroundTask(task)
+  }
+
+  /// Swaps the engine-less storyboard controller for a plain notice before the
+  /// window is shown, so nothing in this launch touches the missing engine.
+  /// See FlutterLaunchEngineGuard for why the engine can be absent.
+  func showFlutterEngineUnavailableNotice(in sceneWindow: UIWindow?) {
+    #if DEBUG
+    let debugBuild = true
+    #else
+    let debugBuild = false
+    #endif
+    let displayName =
+      (Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String) ?? "Omi"
+    let message = FlutterLaunchEngineGuard.unavailableNotice(
+      debugBuild: debugBuild,
+      bundleDisplayName: displayName
+    )
+    NSLog("[OmiLaunch] Flutter engine unavailable at launch; skipping plugin registration.\n%@", message)
+
+    let notice = UIViewController()
+    notice.view.backgroundColor = .systemBackground
+    let label = UILabel()
+    label.numberOfLines = 0
+    label.textAlignment = .center
+    label.font = .preferredFont(forTextStyle: .body)
+    label.textColor = .label
+    label.text = message
+    label.translatesAutoresizingMaskIntoConstraints = false
+    notice.view.addSubview(label)
+    NSLayoutConstraint.activate([
+      label.leadingAnchor.constraint(equalTo: notice.view.layoutMarginsGuide.leadingAnchor, constant: 16),
+      label.trailingAnchor.constraint(equalTo: notice.view.layoutMarginsGuide.trailingAnchor, constant: -16),
+      label.centerYAnchor.constraint(equalTo: notice.view.centerYAnchor),
+    ])
+    // Also covers an iOS background relaunch (BLE/VoIP): nothing is drawn
+    // until the user foregrounds the app, and this is what they see then.
+    sceneWindow?.rootViewController = notice
+    sceneWindow?.makeKeyAndVisible()
+  }
+
+  override func applicationDidEnterBackground(_ application: UIApplication) {
+    super.applicationDidEnterBackground(application)
+    OmiBleManager.shared.markBackgroundTelemetryStart()
+    if #available(iOS 13.0, *) {
+      // The plugin delegate schedules this request from the super call above;
+      // cancel it after delegate dispatch so an idle app is not woken for an
+      // empty 25-second operation.
+      BGTaskScheduler.shared.cancel(
+        taskRequestWithIdentifier: AppDelegate.unusedForegroundTaskRefreshIdentifier
+      )
+    }
+  }
+
+  override func applicationDidBecomeActive(_ application: UIApplication) {
+    OmiBleManager.shared.markBackgroundTelemetryEnd()
+    super.applicationDidBecomeActive(application)
+  }
+
+  // Meta AI app calls back into this app to finish Ray-Ban Meta registration
+  // (AppLinkURLScheme in the MWDAT Info.plist dictionary).
+  override func application(
+    _ app: UIApplication,
+    open url: URL,
+    options: [UIApplication.OpenURLOptionsKey: Any] = [:]
+  ) -> Bool {
+    if rayBanMetaHostApi?.handleUrl(url) == true {
+      return true
+    }
+    return super.application(app, open: url, options: options)
   }
 
   private func handleMethodCall(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -56,17 +642,77 @@ import app_links
     }
     
   }
-    
+  
+  private func handleAppleRemindersCall(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    appleRemindersService.handleMethodCall(call, result: result)
+  }
+
+  private func handleAppleHealthCall(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    appleHealthService.handleMethodCall(call, result: result)
+  }
+
+  // MARK: - Silent Push for Apple Reminders Auto-Sync
+
+  override func application(
+      _ application: UIApplication,
+      didReceiveRemoteNotification userInfo: [AnyHashable: Any],
+      fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
+  ) {
+      // Check if it's Apple Reminders sync
+      if let type = userInfo["type"] as? String, type == "apple_reminders_sync" {
+          handleAppleRemindersSync(userInfo: userInfo, completionHandler: completionHandler)
+          return
+      }
+
+      // Also check nested under "data" key (some FCM configurations)
+      if let data = userInfo["data"] as? [String: Any],
+         let type = data["type"] as? String,
+         type == "apple_reminders_sync" {
+          handleAppleRemindersSync(userInfo: data, completionHandler: completionHandler)
+          return
+      }
+
+      super.application(application, didReceiveRemoteNotification: userInfo, fetchCompletionHandler: completionHandler)
+  }
+
+  private func handleAppleRemindersSync(
+      userInfo: [AnyHashable: Any],
+      completionHandler: @escaping (UIBackgroundFetchResult) -> Void
+  ) {
+      guard let itemsJson = userInfo["items"] as? String else {
+          completionHandler(.failed)
+          return
+      }
+
+      let exportedMappings = appleRemindersService.syncBatchFromJSON(itemsJson)
+
+      if !exportedMappings.isEmpty {
+          DispatchQueue.main.async {
+              self.appleRemindersChannel?.invokeMethod("markExportedBatch", arguments: ["mappings": exportedMappings])
+          }
+      }
+
+      completionHandler(exportedMappings.isEmpty ? .noData : .newData)
+  }
+
+  override func applicationWillEnterForeground(_ application: UIApplication) {
+    super.applicationWillEnterForeground(application)
+    OmiBleManager.shared.reconnectStalePeripherals()
+  }
 
   override func applicationWillTerminate(_ application: UIApplication) {
-    // If title and body are nil, then we don't need to show notification.
-    if notificationTitleOnKill == nil || notificationBodyOnKill == nil {
-      return
+    QuickActionsIconPatcher.shared.stopObserving()
+    OmiBleManager.shared.disconnectAllPeripherals()
+    if #available(iOS 16.1, *) {
+      LiveActivityManager.endAllBeforeTermination()
     }
 
+    // If title and body are nil, then we don't need to show notification.
+    guard let title = notificationTitleOnKill, let body = notificationBodyOnKill else { return }
+
     let content = UNMutableNotificationContent()
-    content.title = notificationTitleOnKill!
-    content.body = notificationBodyOnKill!
+    content.title = title
+    content.body = body
     let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
     let request = UNNotificationRequest(identifier: "notification on app kill", content: content, trigger: trigger)
 
@@ -79,10 +725,649 @@ import app_links
         NSLog("Show notification on kill now")
       }
     }
-  }
+    }
+
+    private func handleAudioChunk(_ message: [String: Any]) {
+        guard isRecordingActive else {
+            print("Ignoring audio chunk - recording not active") // probably started recording with main omi app closed
+            return
+        }
+
+        guard let audioChunk = message["audioChunk"] as? Data,
+              let chunkIndex = message["chunkIndex"] as? Int,
+              let isLast = message["isLast"] as? Bool,
+              let sampleRate = message["sampleRate"] as? Double else {
+            return
+        }
+
+        audioChunks[chunkIndex] = (audioChunk, sampleRate)
+
+        if isLast {
+            reassembleAndSendAudioData()
+        } else {
+            // Prepend 3 dummy bytes so downstream can uniformly strip headers
+            var prefixedChunk = Data([0x00, 0x00, 0x00])
+            prefixedChunk.append(audioChunk)
+            let flutterData = FlutterStandardTypedData(bytes: prefixedChunk)
+            self.flutterWatchAPI?.onAudioChunk(audioChunk: flutterData, chunkIndex: Int64(chunkIndex), isLast: isLast, sampleRate: sampleRate) { result in
+                switch result {
+                case .success:
+                    break
+                case .failure(let error):
+                    print("Audio chunk \(chunkIndex) sent to Flutter - Error: \(error.message)")
+                }
+            }
+        }
+    }
+
+    private func reassembleAndSendAudioData() {
+        // Sort chunks by index and combine them
+        let sortedChunks = audioChunks.sorted(by: { $0.key < $1.key })
+        var combinedData = Data()
+        var sampleRate: Double = 48000.0 // Default fallback
+
+        for (_, chunkTuple) in sortedChunks {
+            let (chunkData, chunkSampleRate) = chunkTuple
+            combinedData.append(chunkData)
+            sampleRate = chunkSampleRate
+        }
+
+        // Prepend 3 dummy bytes for full buffer as well
+        var prefixed = Data([0x00, 0x00, 0x00])
+        prefixed.append(combinedData)
+        let flutterData = FlutterStandardTypedData(bytes: prefixed)
+        self.flutterWatchAPI?.onAudioData(audioData: flutterData) { result in
+            switch result {
+            case .success:
+                break
+            case .failure(let error):
+                print("Complete audio data sent to Flutter - Error: \(error.message)")
+            }
+        }
+
+        audioChunks.removeAll()
+        nextExpectedChunkIndex = 0
+    }
 }
 
-// here
 func registerPlugins(registry: FlutterPluginRegistry) {
   GeneratedPluginRegistrant.register(with: registry)
+}
+
+extension AppDelegate: WCSessionDelegate {
+    
+    func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) { }
+    
+    func sessionDidBecomeInactive(_ session: WCSession) {
+        print("Session Watch Become Inactive")
+    }
+    
+    func sessionDidDeactivate(_ session: WCSession) {
+        print("Session Watch Deactivate")
+    }
+    
+    // Receive a message from watch (foreground/active)
+    func session(_ session: WCSession, didReceiveMessage message: [String : Any]) {
+        Task {
+            guard let method = message["method"] as? String else {
+                return
+            }
+
+            switch method {
+            case "startRecording":
+                self.isRecordingActive = true
+                self.audioChunks.removeAll()
+                self.nextExpectedChunkIndex = 0
+                
+                DispatchQueue.main.async {
+                    self.flutterWatchAPI?.onRecordingStarted() { result in
+                        switch result {
+                        case .success:
+                            break
+                        case .failure(let error):
+                            print("iOS: Recording started notification sent to Flutter - Error: \(error.message)")
+                        }
+                    }
+                }
+            case "stopRecording":
+                self.isRecordingActive = false
+                self.flutterWatchAPI?.onRecordingStopped() { result in
+                    switch result {
+                    case .success:
+                        break
+                    case .failure(let error):
+                        print("Recording stopped on Flutter - Error: \(error.message)")
+                    }
+                }
+            case "sendAudioData":
+                if let audioData = message["audioData"] as? Data {
+                    // Prepend 3 dummy bytes for single-shot audio data
+                    var prefixed = Data([0x00, 0x00, 0x00])
+                    prefixed.append(audioData)
+                    let flutterData = FlutterStandardTypedData(bytes: prefixed)
+                    self.flutterWatchAPI?.onAudioData(audioData: flutterData) { result in
+                        switch result {
+                        case .success:
+                            break
+                        case .failure(let error):
+                            print("Audio data sent to Flutter - Error: \(error.message)")
+                        }
+                    }
+                } else {
+                    print("Failed to cast audioData as Data - received type: \(type(of: message["audioData"]))")
+                }
+            case "sendAudioChunk":
+                self.handleAudioChunk(message)
+            case "recordingError":
+                if let error = message["error"] as? String {
+                    self.flutterWatchAPI?.onRecordingError(error: error) { result in
+                        switch result {
+                        case .success:
+                            break
+                        case .failure(let error):
+                            print("Recording error sent to Flutter - Error: \(error.message)")
+                        }
+                    }
+                }
+            case "microphonePermissionResult":
+                if let granted = message["granted"] as? Bool {
+                    self.flutterWatchAPI?.onMicrophonePermissionResult(granted: granted) { result in
+                        switch result {
+                        case .success:
+                            break
+                        case .failure(let error):
+                            print("Microphone permission result sent to Flutter - Error: \(error.message)")
+                        }
+                    }
+                }
+            case "batteryUpdate":
+                if let batteryLevel = message["batteryLevel"] as? Double,
+                   let batteryState = message["batteryState"] as? Int {
+                    try? SafeDefaults.store(.double(batteryLevel), forKey: "watch_battery_level")
+                    try? SafeDefaults.store(.int(batteryState), forKey: "watch_battery_state")
+                    try? SafeDefaults.store(.date(Date()), forKey: "watch_battery_last_updated")
+                    
+                    DispatchQueue.main.async {
+                        self.flutterWatchAPI?.onWatchBatteryUpdate(batteryLevel: batteryLevel, batteryState: Int64(batteryState)) { result in
+                            switch result {
+                            case .success:
+                                break
+                            case .failure(let error):
+                                print("iOS: Battery update sent to Flutter - Error: \(error.message)")
+                            }
+                        }
+                    }
+                }
+            case "watchInfoUpdate":
+                if let name = message["name"] as? String,
+                   let model = message["model"] as? String,
+                   let systemVersion = message["systemVersion"] as? String,
+                   let localizedModel = message["localizedModel"] as? String {
+
+                    try? SafeDefaults.store(.string(name), forKey: "watch_device_name")
+                    try? SafeDefaults.store(.string(model), forKey: "watch_device_model")
+                    try? SafeDefaults.store(.string(systemVersion), forKey: "watch_system_version")
+                    try? SafeDefaults.store(.string(localizedModel), forKey: "watch_localized_model")
+                    try? SafeDefaults.store(.date(Date()), forKey: "watch_info_last_updated")
+                }
+            default:
+                print("Unknown method: \(method)")
+            }
+        }
+    }
+    
+    // Receive user info from watch (background/offline)
+    // Used for 1.5 second audio chunks when screen is off or app is backgrounded
+    func session(_ session: WCSession, didReceiveUserInfo userInfo: [String : Any]) {
+        
+        Task {
+            guard let method = userInfo["method"] as? String else {
+                return
+            }
+            
+            switch method {
+            case "sendAudioChunk":
+                self.handleAudioChunk(userInfo)
+            case "stopRecording":
+                self.isRecordingActive = false
+                    self.flutterWatchAPI?.onRecordingStopped() { result in
+                    switch result {
+                    case .success:
+                        break
+                    case .failure(let error):
+                        print("Stop recording (background) sent to Flutter - Error: \(error.message)")
+                    }
+                }
+            case "recordingError":
+                if let error = userInfo["error"] as? String {
+                    self.flutterWatchAPI?.onRecordingError(error: error) { result in
+                        switch result {
+                        case .success:
+                            break
+                        case .failure(let error):
+                            print("Recording error (background) sent to Flutter - Error: \(error.message)")
+                        }
+                    }
+                }
+            case "batteryUpdate":
+                if let batteryLevel = userInfo["batteryLevel"] as? Double,
+                   let batteryState = userInfo["batteryState"] as? Int {
+                    try? SafeDefaults.store(.double(batteryLevel), forKey: "watch_battery_level")
+                    try? SafeDefaults.store(.int(batteryState), forKey: "watch_battery_state")
+                    try? SafeDefaults.store(.date(Date()), forKey: "watch_battery_last_updated")
+                    
+                    DispatchQueue.main.async {
+                        self.flutterWatchAPI?.onWatchBatteryUpdate(batteryLevel: batteryLevel, batteryState: Int64(batteryState)) { result in
+                            switch result {
+                            case .success:
+                                break
+                            case .failure(let error):
+                                print("iOS: Background battery update sent to Flutter - Error: \(error.message)")
+                            }
+                        }
+                    }
+                }
+            case "watchInfoUpdate":
+                if let name = userInfo["name"] as? String,
+                   let model = userInfo["model"] as? String,
+                   let systemVersion = userInfo["systemVersion"] as? String,
+                   let localizedModel = userInfo["localizedModel"] as? String {
+                    try? SafeDefaults.store(.string(name), forKey: "watch_device_name")
+                    try? SafeDefaults.store(.string(model), forKey: "watch_device_model")
+                    try? SafeDefaults.store(.string(systemVersion), forKey: "watch_system_version")
+                    try? SafeDefaults.store(.string(localizedModel), forKey: "watch_localized_model")
+                    try? SafeDefaults.store(.date(Date()), forKey: "watch_info_last_updated")
+                }
+            default:
+                print("Unknown background method: \(method)")
+            }
+        }
+    }
+}
+
+/// iOS 26 on-device transcription through SpeechAnalyzer. Unlike
+/// SFSpeechRecognizer's on-device mode, it does not depend on Siri or
+/// Dictation being enabled in Settings: the language model is an asset the
+/// app installs itself through AssetInventory. Used first on iOS 26; the
+/// SFSpeechRecognizer path below remains for older systems and as a fallback.
+@available(iOS 26, *)
+@MainActor
+enum SpeechAnalyzerTranscription {
+    enum TranscriptionError: Error {
+        case unsupportedLanguage(String)
+        case timedOut
+    }
+
+    /// In-flight model downloads keyed by BCP-47 locale, so the pre-flight
+    /// probe and the first transcribe() share one download.
+    private static var installTasks: [String: Task<Void, Error>] = [:]
+
+    static func requestedLanguage(_ language: String) -> String {
+        let requested = language.isEmpty || language == "multi" ? "en" : language
+        return Locale(identifier: requested).language.languageCode?.identifier ?? requested
+    }
+
+    /// Best locale for the app's (bare) language code: an installed model
+    /// first, then any supported one, preferring the device locale in each.
+    static func locale(for language: String) async -> Locale? {
+        let wanted = requestedLanguage(language)
+        let current = Locale.current.identifier(.bcp47)
+        func pick(_ locales: [Locale]) -> Locale? {
+            let matching = locales.filter { $0.language.languageCode?.identifier == wanted }
+            return matching.first { $0.identifier(.bcp47) == current }
+                ?? matching.sorted { $0.identifier(.bcp47) < $1.identifier(.bcp47) }.first
+        }
+        if let installed = pick(await SpeechTranscriber.installedLocales) { return installed }
+        return pick(await SpeechTranscriber.supportedLocales)
+    }
+
+    static func isInstalled(_ locale: Locale) async -> Bool {
+        await SpeechTranscriber.installedLocales.contains { $0.identifier(.bcp47) == locale.identifier(.bcp47) }
+    }
+
+    /// Installs the model for `locale` if it is not already on the device.
+    /// Concurrent callers wait on the same download.
+    static func ensureModel(for locale: Locale) async throws {
+        if await isInstalled(locale) { return }
+        let key = locale.identifier(.bcp47)
+        let task: Task<Void, Error>
+        if let existing = installTasks[key] {
+            task = existing
+        } else {
+            task = Task {
+                let transcriber = SpeechTranscriber(locale: locale, preset: .transcription)
+                if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+                    NSLog("[SpeechAnalyzer] downloading speech model for %@", key)
+                    try await request.downloadAndInstall()
+                    NSLog("[SpeechAnalyzer] speech model installed for %@", key)
+                }
+            }
+            installTasks[key] = task
+        }
+        defer {
+            if installTasks[key] == task { installTasks[key] = nil }
+        }
+        try await task.value
+    }
+
+    /// Whether transcription can run for `language`: the locale is supported
+    /// and its model is installed, or finishes installing within
+    /// `installWait`. A download still running after that counts as available
+    /// too; it continues in the background and transcribe() waits for it.
+    /// Only a failed download (no network, unsupported locale) reports false.
+    static func isAvailable(language: String, installWait: Double = 8) async -> Bool {
+        guard let locale = await locale(for: language) else {
+            NSLog("[SpeechAnalyzer] no supported locale for language %@", language)
+            return false
+        }
+        if await isInstalled(locale) { return true }
+        return await SpeechDeadline.run(seconds: installWait, operation: {
+            do {
+                try await ensureModel(for: locale)
+                return true
+            } catch {
+                NSLog("[SpeechAnalyzer] model install failed for %@: %@", locale.identifier(.bcp47), error.localizedDescription)
+                return false
+            }
+        }, onTimeout: {
+            // The shared download keeps running; only this availability waiter
+            // has a deadline. A later transcription shares the same download.
+            true
+        })
+    }
+
+    /// Transcribes a whole audio file (the Dart side writes 16 kHz mono WAV
+    /// clips) and returns the text, empty when no speech was recognized.
+    static func transcribe(fileURL: URL, language: String) async throws -> String {
+        guard let locale = await locale(for: language) else {
+            throw TranscriptionError.unsupportedLanguage(language)
+        }
+        let installed: Result<Void, Error> = await SpeechDeadline.run(seconds: 20, operation: {
+            do {
+                try await ensureModel(for: locale)
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }, onTimeout: { .failure(TranscriptionError.timedOut) })
+        try installed.get()
+
+        let transcriber = SpeechTranscriber(locale: locale, preset: .transcription)
+        let analyzer = SpeechAnalyzer(modules: [transcriber])
+        let collector = Task { () throws -> String in
+            var finalText = ""
+            var volatileText = ""
+            for try await result in transcriber.results {
+                let text = String(result.text.characters)
+                if result.isFinal {
+                    finalText += text
+                } else {
+                    volatileText = text
+                }
+            }
+            return finalText.isEmpty ? volatileText : finalText
+        }
+        let outcome: Result<String, Error> = await SpeechDeadline.run(seconds: 20, operation: {
+            do {
+                let file = try AVAudioFile(forReading: fileURL)
+                if let lastSample = try await analyzer.analyzeSequence(from: file) {
+                    try await analyzer.finalizeAndFinish(through: lastSample)
+                } else {
+                    await analyzer.cancelAndFinishNow()
+                }
+                return .success(try await collector.value.trimmingCharacters(in: .whitespacesAndNewlines))
+            } catch {
+                await analyzer.cancelAndFinishNow()
+                collector.cancel()
+                return .failure(error)
+            }
+        }, onTimeout: {
+            collector.cancel()
+            await analyzer.cancelAndFinishNow()
+            return .failure(TranscriptionError.timedOut)
+        })
+        return try outcome.get()
+    }
+}
+
+class SpeechRecognitionHandler: NSObject {
+    
+    func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        if call.method == "transcribe" {
+            guard let args = call.arguments as? [String: Any],
+                  let path = args["filePath"] as? String else {
+                result(FlutterError(code: "INVALID_ARGS", message: "Missing arguments", details: nil))
+                return
+            }
+            
+            let language = args["language"] as? String ?? "en-US"
+            if #available(iOS 26, *) {
+                // SpeechAnalyzer needs no Dictation setting; fall back to
+                // SFSpeechRecognizer only if it cannot handle this clip.
+                Task {
+                    do {
+                        let text = try await SpeechAnalyzerTranscription.transcribe(
+                            fileURL: URL(fileURLWithPath: path), language: language)
+                        DispatchQueue.main.async { result(text) }
+                    } catch {
+                        NSLog("[SpeechAnalyzer] transcribe failed, falling back to SFSpeechRecognizer: %@", error.localizedDescription)
+                        DispatchQueue.main.async {
+                            self.transcribe(filePath: path, language: language, result: result)
+                        }
+                    }
+                }
+                return
+            }
+            transcribe(filePath: path, language: language, result: result)
+        } else if call.method == "onDeviceAvailable" {
+            let args = call.arguments as? [String: Any]
+            let language = args?["language"] as? String ?? "en-US"
+            if #available(iOS 26, *) {
+                Task {
+                    if await SpeechAnalyzerTranscription.isAvailable(language: language) {
+                        DispatchQueue.main.async { result(true) }
+                    } else {
+                        DispatchQueue.main.async {
+                            self.probeOnDeviceRecognition(language: language, result: result)
+                        }
+                    }
+                }
+                return
+            }
+            probeOnDeviceRecognition(language: language, result: result)
+        } else {
+            result(FlutterMethodNotImplemented)
+        }
+    }
+
+    /// Resolve the app's language setting to a locale whose recognizer can run
+    /// on-device. The app passes bare language codes ("en"); on-device assets
+    /// are installed per full locale ("en-US"), and a recognizer built from a
+    /// bare code fails every request with kAFAssistantErrorDomain 1101 once
+    /// `requiresOnDeviceRecognition` is set. Prefer the device's own locale
+    /// when it matches the language (that is the model most likely to be
+    /// installed), then any supported locale for that language.
+    static func onDeviceRecognizer(for language: String) -> SFSpeechRecognizer? {
+        let requested = language.isEmpty || language == "multi" ? "en" : language
+        let requestedLocale = Locale(identifier: requested)
+        let requestedLanguage = requestedLocale.languageCode ?? requested
+
+        var candidates: [Locale] = []
+        if requested.contains("-") || requested.contains("_") {
+            candidates.append(requestedLocale)
+        }
+        if Locale.current.languageCode == requestedLanguage {
+            candidates.append(Locale.current)
+        }
+        candidates.append(contentsOf: SFSpeechRecognizer.supportedLocales()
+            .filter { $0.languageCode == requestedLanguage }
+            .sorted { $0.identifier < $1.identifier })
+        candidates.append(requestedLocale)
+
+        var seen = Set<String>()
+        for locale in candidates {
+            guard seen.insert(locale.identifier).inserted else { continue }
+            guard let recognizer = SFSpeechRecognizer(locale: locale) else { continue }
+            if recognizer.isAvailable && recognizer.supportsOnDeviceRecognition {
+                return recognizer
+            }
+        }
+        return nil
+    }
+
+    /// Whether on-device recognition can actually run right now, checked by
+    /// recognizing a short silent clip. `supportsOnDeviceRecognition` alone is
+    /// not enough: with Siri and Dictation disabled in iOS Settings every
+    /// request fails at run time with kLSRErrorDomain 201 while the recognizer
+    /// still advertises on-device support. Reports true on "no speech" (1110,
+    /// the expected outcome for silence) and false on any other error, so a
+    /// caller never falls back onto a recognizer that cannot work.
+    private func probeOnDeviceRecognition(language: String, result: @escaping FlutterResult) {
+        guard let recognizer = SpeechRecognitionHandler.onDeviceRecognizer(for: language) else {
+            result(false)
+            return
+        }
+        guard let silence = SpeechRecognitionHandler.writeSilentWav(seconds: 0.6) else {
+            result(true) // Could not build a probe clip; do not block the fallback on that.
+            return
+        }
+
+        var finished = false
+        var task: SFSpeechRecognitionTask?
+        let finish: (Bool) -> Void = { value in
+            guard !finished else { return }
+            finished = true
+            task?.cancel()
+            try? FileManager.default.removeItem(at: silence)
+            result(value)
+        }
+
+        let request = SFSpeechURLRecognitionRequest(url: silence)
+        request.shouldReportPartialResults = false
+        request.requiresOnDeviceRecognition = true
+        task = recognizer.recognitionTask(with: request) { recognitionResult, error in
+            DispatchQueue.main.async {
+                if let error = error {
+                    let nsError = error as NSError
+                    let noSpeech = nsError.domain == "kAFAssistantErrorDomain" && nsError.code == 1110
+                    if !noSpeech {
+                        NSLog("[SpeechRecognition] on-device probe failed: %@ %ld %@", nsError.domain, nsError.code, error.localizedDescription)
+                    }
+                    finish(noSpeech)
+                    return
+                }
+                if recognitionResult?.isFinal == true {
+                    finish(true)
+                }
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+            guard !finished else { return }
+            finish(true) // Slow but not failing; let the real request decide.
+        }
+    }
+
+    /// 16 kHz mono 16-bit PCM WAV of silence, for probing the recognizer.
+    static func writeSilentWav(seconds: Double) -> URL? {
+        let sampleRate = 16000
+        let sampleCount = CheckedIntegerConversion.int(Double(sampleRate) * seconds) ?? 0
+        let dataSize = sampleCount * 2
+        var data = Data(capacity: 44 + dataSize)
+        func append<T: FixedWidthInteger>(_ value: T) {
+            var little = value.littleEndian
+            data.append(Data(bytes: &little, count: MemoryLayout<T>.size))
+        }
+        data.append(contentsOf: Array("RIFF".utf8)); append(UInt32(36 + dataSize))
+        data.append(contentsOf: Array("WAVE".utf8))
+        data.append(contentsOf: Array("fmt ".utf8)); append(UInt32(16)); append(UInt16(1)); append(UInt16(1))
+        append(UInt32(sampleRate)); append(UInt32(sampleRate * 2)); append(UInt16(2)); append(UInt16(16))
+        data.append(contentsOf: Array("data".utf8)); append(UInt32(dataSize))
+        data.append(Data(count: dataSize))
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("omi_speech_probe_\(UUID().uuidString).wav")
+        do {
+            try data.write(to: url)
+            return url
+        } catch {
+            return nil
+        }
+    }
+
+    private func transcribe(filePath: String, language: String, result: @escaping FlutterResult) {
+        // Request authorization first
+        SFSpeechRecognizer.requestAuthorization { authStatus in
+            DispatchQueue.main.async {
+                if authStatus != .authorized {
+                    result(FlutterError(code: "UNAUTHORIZED", message: "Speech recognition not authorized", details: nil))
+                    return
+                }
+
+                let fileUrl = URL(fileURLWithPath: filePath)
+
+                guard let recognizer = SpeechRecognitionHandler.onDeviceRecognizer(for: language) else {
+                    result(FlutterError(code: "UNAVAILABLE", message: "No on-device speech recognizer available for language \(language)", details: nil))
+                    return
+                }
+
+                let request = SFSpeechURLRecognitionRequest(url: fileUrl)
+                // Partial results are kept so a task that never reports `isFinal`
+                // (observed with on-device recognition on short clips) still
+                // yields its best transcription instead of hanging the caller.
+                request.shouldReportPartialResults = true
+                request.requiresOnDeviceRecognition = true // Force on-device
+                request.taskHint = .dictation
+                if #available(iOS 16, *) {
+                    request.addsPunctuation = true
+                }
+
+                // The Dart caller awaits exactly one reply per clip, and its polling
+                // loop stays busy until that reply arrives — a task that never
+                // completes would silently stop all further transcription. Reply
+                // once, on the first of: final result, error, or timeout.
+                var finished = false
+                var latestText = ""
+                var task: SFSpeechRecognitionTask?
+                let finish: (Any?) -> Void = { value in
+                    guard !finished else { return }
+                    finished = true
+                    task?.cancel()
+                    result(value)
+                }
+
+                task = recognizer.recognitionTask(with: request) { (recognitionResult, error) in
+                    DispatchQueue.main.async {
+                        if let recognitionResult = recognitionResult {
+                            latestText = recognitionResult.bestTranscription.formattedString
+                            if recognitionResult.isFinal {
+                                finish(latestText)
+                                return
+                            }
+                        }
+                        if let error = error {
+                            let nsError = error as NSError
+                            // 1110 = no speech in the clip; a partial transcription before the
+                            // error is still the best answer for that clip. Only a failure that
+                            // produced nothing is reported as an error.
+                            if !latestText.isEmpty || (nsError.domain == "kAFAssistantErrorDomain" && nsError.code == 1110) {
+                                finish(latestText)
+                            } else {
+                                finish(FlutterError(
+                                    code: "RECOGNITION_ERROR",
+                                    message: "\(nsError.domain) \(nsError.code): \(error.localizedDescription) (locale \(recognizer.locale.identifier))",
+                                    details: nil))
+                            }
+                        }
+                    }
+                }
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + 20) {
+                    guard !finished else { return }
+                    if latestText.isEmpty {
+                        finish(FlutterError(code: "RECOGNITION_TIMEOUT", message: "On-device recognition timed out", details: nil))
+                    } else {
+                        finish(latestText)
+                    }
+                }
+            }
+        }
+    }
 }

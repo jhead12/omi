@@ -1,8 +1,14 @@
-from typing import List, Optional, Any
+from typing import Any, List, Optional
 
 from pydantic import BaseModel
 
-from models.conversation import Conversation, Message
+from models.chat import Message
+from models.conversation import Conversation
+from models.transcript_segment import transcript_segment_for_client
+
+# Freemium action constants
+FREEMIUM_ACTION_SETUP_ON_DEVICE_STT = "setup_on_device_stt"
+FREEMIUM_ACTION_NONE = "none"
 
 
 class MessageEvent(BaseModel):
@@ -18,6 +24,16 @@ class MessageEvent(BaseModel):
 class ConversationEvent(MessageEvent):
     memory: Conversation
     messages: Optional[List[Message]] = []
+    # The recording identity that caused this lifecycle event.  It is optional
+    # for older producers, but identified listen sessions must propagate it so
+    # clients never infer ownership from the WebSocket that delivered the event.
+    recording_session_id: Optional[str] = None
+    # Versioned recording-session envelope. These are additive so older
+    # producers and clients retain their existing compatibility path.
+    conversation_id: Optional[str] = None
+    lifecycle_version: Optional[int] = None
+    lifecycle_phase: Optional[str] = None
+    lifecycle_sequence: Optional[int] = None
 
     def to_json(self):
         j = self.model_dump(mode="json")
@@ -77,6 +93,29 @@ class MessageServiceStatusEvent(MessageEvent):
     event_type: str = "service_status"
     status: str
     status_text: Optional[str] = None
+    outcome: Optional[str] = None
+    provider: Optional[str] = None
+    retryable: Optional[bool] = None
+    reason: Optional[str] = None
+    retry_after: Optional[int] = None
+
+    def to_json(self):
+        # The outcome fields are an additive terminal-failure contract, not
+        # nullable noise on legacy ready and initiating status events.
+        j = self.model_dump(mode="json", exclude_none=True)
+        j["type"] = self.event_type
+        del j["event_type"]
+        return j
+
+
+class ConversationSessionEvent(MessageEvent):
+    event_type: str = "conversation_session"
+    conversation_id: str
+    status: str = "in_progress"
+    recording_session_id: Optional[str] = None
+    lifecycle_version: Optional[int] = None
+    lifecycle_phase: Optional[str] = None
+    lifecycle_sequence: Optional[int] = None
 
     def to_json(self):
         j = self.model_dump(mode="json")
@@ -108,10 +147,109 @@ class LastConversationEvent(MessageEvent):
 
 class TranslationEvent(MessageEvent):
     event_type: str = "translating"
-    segments: List = []
+    segments: List[dict[str, Any]] = []
 
     def to_json(self):
         j = self.model_dump(mode="json")
         j["type"] = self.event_type
         del j["event_type"]
+        # Callers pass stored segment dicts; storage-only placement evidence stays server-side.
+        j["segments"] = [transcript_segment_for_client(segment) for segment in j.get("segments") or []]
+        return j
+
+
+class PhotoProcessingEvent(MessageEvent):
+    event_type: str = "photo_processing"
+    temp_id: str
+    photo_id: str
+
+    def to_json(self):
+        j = self.model_dump(mode="json")
+        j["type"] = self.event_type
+        del j["event_type"]
+        return j
+
+
+class PhotoDescribedEvent(MessageEvent):
+    event_type: str = "photo_described"
+    photo_id: str
+    description: str
+    discarded: bool
+
+    def to_json(self):
+        j = self.model_dump(mode="json")
+        j["type"] = self.event_type
+        del j["event_type"]
+        return j
+
+
+class SpeakerLabelSuggestionEvent(MessageEvent):
+    event_type: str = "speaker_label_suggestion"
+    speaker_id: int
+    person_id: str
+    person_name: str
+    segment_id: str
+    # Set only with an empty person_id: a pinned person this voice nearly matched (a question, never a label).
+    suggested_person_id: Optional[str] = None
+    retracted: bool = False
+
+    def to_json(self):
+        j = self.model_dump(mode="json")
+        j["type"] = self.event_type
+        del j["event_type"]
+        if j.get("suggested_person_id") is None:
+            j.pop("suggested_person_id", None)
+        if not self.retracted:
+            j.pop("retracted", None)
+        return j
+
+
+class FreemiumThresholdReachedEvent(MessageEvent):
+    event_type: str = "freemium_threshold_reached"
+    remaining_seconds: int
+    action: str
+
+    def to_json(self):
+        j = self.model_dump(mode="json")
+        j["type"] = self.event_type
+        del j["event_type"]
+        return j
+
+
+class SegmentsDeletedEvent(MessageEvent):
+    event_type: str = "segments_deleted"
+    segment_ids: List[str]
+
+    def to_json(self):
+        j = self.model_dump(mode="json")
+        j["type"] = self.event_type
+        del j["event_type"]
+        return j
+
+
+class ProactiveMessageEvent(MessageEvent):
+    event_type: str = "proactive_message"
+    app_id: str
+    title: str
+    message: str
+    conversation_id: Optional[str] = None
+
+    def to_json(self):
+        j = self.model_dump(mode="json", exclude_none=True)
+        j["type"] = self.event_type
+        del j["event_type"]
+        return j
+
+
+class ProactivityV2Event(MessageEvent):
+    """Identity-only wakeup; clients fetch authenticated feed content."""
+
+    event_type: str = "proactivity_v2"
+    item_id: str
+    target_kind: str
+    target_id: str
+
+    def to_json(self):
+        j = self.model_dump(mode="json")
+        j["type"] = j.pop("event_type")
         return j

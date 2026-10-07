@@ -1,10 +1,20 @@
-import 'package:cached_network_image/cached_network_image.dart';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+
+import 'package:cached_network_image/cached_network_image.dart';
+
 import 'package:omi/backend/schema/message.dart';
+import 'package:omi/ui/ui.dart';
 
 class FilesHandlerWidget extends StatelessWidget {
   final ServerMessage message;
   const FilesHandlerWidget({super.key, required this.message});
+
+  bool _isLocalPath(String? path) {
+    if (path == null || path.isEmpty) return false;
+    return path.startsWith('/') || path.startsWith('file://');
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -24,51 +34,23 @@ class FilesHandlerWidget extends StatelessWidget {
           },
           itemBuilder: (context, index) {
             if (message.files[index].mimeTypeToFileType() == 'image') {
-              return CachedNetworkImage(
-                imageUrl: message.files[index].thumbnail ?? '',
-                imageBuilder: (context, imageProvider) => Container(
-                  margin: const EdgeInsets.only(bottom: 6, top: 2),
-                  decoration: BoxDecoration(
-                    color: Theme.of(context).primaryColor,
-                    borderRadius: const BorderRadius.all(Radius.circular(10.0)),
-                    image: DecorationImage(image: imageProvider, fit: BoxFit.cover),
-                  ),
-                  width: MediaQuery.sizeOf(context).width * 0.28,
-                  height: MediaQuery.sizeOf(context).width * 0.22,
-                ),
-                placeholder: (context, url) => SizedBox(
-                  width: MediaQuery.sizeOf(context).width * 0.28,
-                  height: MediaQuery.sizeOf(context).width * 0.22,
-                  child: const Center(
-                    child: CircularProgressIndicator(
-                      valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                    ),
-                  ),
-                ),
-                errorWidget: (context, url, error) => const Icon(Icons.error, color: Colors.white),
-              );
+              return _buildImageThumbnail(context, index);
             } else {
               return Container(
-                decoration: BoxDecoration(
-                  color: Theme.of(context).primaryColor,
-                  borderRadius: const BorderRadius.all(Radius.circular(10.0)),
-                ),
+                decoration: BoxDecoration(color: OmiColors.surface2, borderRadius: OmiRadius.mdAll),
                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
                 margin: const EdgeInsets.only(bottom: 6, top: 2),
                 width: MediaQuery.sizeOf(context).width * 0.32,
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    const Icon(Icons.insert_drive_file, color: Colors.white),
+                    Icon(Icons.insert_drive_file, color: OmiColors.textPrimary),
                     const SizedBox(height: 6),
                     Text(
                       message.files[index].name,
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 14,
-                      ),
+                      style: OmiType.footnote,
                     ),
                   ],
                 ),
@@ -78,5 +60,51 @@ class FilesHandlerWidget extends StatelessWidget {
         ),
       );
     }
+  }
+
+  Widget _buildImageThumbnail(BuildContext context, int index) {
+    final thumbnail = message.files[index].thumbnail;
+    final width = MediaQuery.sizeOf(context).width * 0.28;
+    final height = MediaQuery.sizeOf(context).width * 0.22;
+
+    if (_isLocalPath(thumbnail)) {
+      final filePath = thumbnail!.startsWith('file://') ? thumbnail.substring(7) : thumbnail;
+      return Container(
+        margin: const EdgeInsets.only(bottom: 6, top: 2),
+        decoration: BoxDecoration(
+          color: OmiColors.surface2,
+          borderRadius: OmiRadius.mdAll,
+          image: DecorationImage(image: FileImage(File(filePath)), fit: BoxFit.cover),
+        ),
+        width: width,
+        height: height,
+      );
+    }
+
+    return CachedNetworkImage(
+      imageUrl: thumbnail ?? '',
+      imageBuilder: (context, imageProvider) => Container(
+        margin: const EdgeInsets.only(bottom: 6, top: 2),
+        decoration: BoxDecoration(
+          color: OmiColors.surface2,
+          borderRadius: OmiRadius.mdAll,
+          image: DecorationImage(image: imageProvider, fit: BoxFit.cover),
+        ),
+        width: width,
+        height: height,
+      ),
+      placeholder: (context, url) => SizedBox(
+        width: width,
+        height: height,
+        child: const Center(child: OmiSpinner(size: OmiSpinnerSize.small)),
+      ),
+      errorWidget: (context, url, error) => Container(
+        margin: const EdgeInsets.only(bottom: 6, top: 2),
+        decoration: BoxDecoration(color: OmiColors.surface2, borderRadius: OmiRadius.mdAll),
+        width: width,
+        height: height,
+        child: Center(child: Icon(Icons.image, color: OmiColors.textTertiary)),
+      ),
+    );
   }
 }

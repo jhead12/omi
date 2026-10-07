@@ -1,5 +1,9 @@
 import { ActionItems as ActionItemsType } from '@/src/types/memory.types';
-import { CheckCircle } from 'iconoir-react';
+import {
+  avatarToneIndex,
+  participantInitials,
+  actionItemFacts,
+} from '@/src/lib/shared-note.mjs';
 
 interface ActionsItemsProps {
   items: ActionItemsType[];
@@ -7,23 +11,45 @@ interface ActionsItemsProps {
 
 export default function ActionItems({ items }: ActionsItemsProps) {
   return (
-    <div className="px-4 md:px-12">
-      <h3 className="text-xl font-semibold md:text-2xl">Action Items</h3>
-      <ul className="mt-3 text-base md:text-lg">
-        {items.map((item, index) => (
-          <li key={index} className="my-5 flex items-start gap-3 first:mt-0">
-            {item.completed ? (
-              <div className="mt-1">
-                <CheckCircle className="min-w-min text-sm text-green-400" />
+    <div>
+      <h2 className="sn-h3">Action items</h2>
+      <ul className="sn-actions">
+        {items.map((item, index) => {
+          const { owner, context, due } = actionItemFacts(item);
+          return (
+            <li
+              key={index}
+              className={`sn-action${item.completed ? ' sn-action-done' : ''}`}
+            >
+              <span className="sn-checkbox" aria-hidden="true" />
+              <span className="sn-sr">
+                {item.completed ? 'Completed' : 'Not completed'}
+              </span>
+              <div className="sn-action-body">
+                <p className="sn-action-text">{item.description}</p>
+                <div className="sn-action-meta">
+                  {owner && (
+                    <span className="sn-owner">
+                      <span
+                        className={`sn-avatar sn-avatar-${avatarToneIndex(owner)}`}
+                        aria-hidden="true"
+                      >
+                        {participantInitials(owner)}
+                      </span>
+                      Owner: {owner}
+                    </span>
+                  )}
+                  {context && <span className="sn-context">{context}</span>}
+                  {due ? (
+                    <time dateTime={due.iso}>Due {due.label}</time>
+                  ) : (
+                    <span>Due Unknown</span>
+                  )}
+                </div>
               </div>
-            ) : (
-              <div className="mt-1">
-                <CheckCircle className="min-w-min text-sm text-zinc-600" />
-              </div>
-            )}
-            <p>{item.description}</p>
-          </li>
-        ))}
+            </li>
+          );
+        })}
       </ul>
     </div>
   );

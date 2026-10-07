@@ -1,30 +1,107 @@
-import { Memory } from '@/src/types/memory.types';
+import { Memory, SharedScreenshotsResult } from '@/src/types/memory.types';
+import { assignSectionIds, splitSections } from '@/src/lib/shared-note.mjs';
 import ActionItems from './action-items';
+import ScreenMoments from './screen-moments';
 import MemoryEvents from '../events/memory-events';
 import Plugins from '../plugins/plugins';
+import Markdown from 'markdown-to-jsx';
 
 interface SummaryProps {
   memory: Memory;
+  screenshots?: SharedScreenshotsResult | null;
 }
 
-export default function Summary({ memory }: SummaryProps) {
+export default function Summary({ memory, screenshots = null }: SummaryProps) {
+  const overview = (memory?.structured?.overview || '').trim();
+  const { mains, sideNotes } = splitSections(memory?.structured?.sections);
+  const ids = assignSectionIds(mains);
+
   return (
-    <div className="flex flex-col gap-10">
-      <div className="mt-10 px-4 md:px-12">
-        <h3 className="text-xl font-semibold md:text-2xl">Overview</h3>
-        {memory.structured.overview ? (
-          <p className="mt-3 text-base md:text-lg">{memory.structured.overview}</p>
-        ) : (
-          <p className="mt-4 text-gray-400">No overview available for this memory.</p>
-        )}
-      </div>
+    <div className="flex flex-col">
+      {mains.length > 0 ? (
+        <>
+          {mains.length >= 4 && (
+            <nav className="sn-toc" aria-label="In this note">
+              <p className="sn-toc-label">In this note</p>
+              <ul className="sn-toc-list">
+                {mains.map((section, index) => (
+                  <li key={ids[index]}>
+                    <a href={`#${ids[index]}`}>
+                      {section.heading?.trim() || `Section ${index + 1}`}
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </nav>
+          )}
+          {mains.map((section, index) => {
+            const heading = section.heading?.trim();
+            const body = section.body_markdown?.trim();
+            return (
+              <section key={ids[index]} id={ids[index]} className="sn-section">
+                {heading ? <h2 className="sn-h2">{heading}</h2> : null}
+                {body ? (
+                  <Markdown className="sn-md" options={{ forceBlock: true }}>
+                    {body}
+                  </Markdown>
+                ) : null}
+              </section>
+            );
+          })}
+          {sideNotes.length > 0 && (
+            <aside className="sn-aside">
+              {sideNotes.map((section, index) => {
+                const heading = section.heading?.trim();
+                const body = section.body_markdown?.trim();
+                return (
+                  <div key={index} className="sn-aside-section">
+                    {heading ? <h2 className="sn-h3">{heading}</h2> : null}
+                    {body ? (
+                      <Markdown className="sn-md" options={{ forceBlock: true }}>
+                        {body}
+                      </Markdown>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </aside>
+          )}
+        </>
+      ) : (
+        overview && (
+          <div className="sn-section">
+            <Markdown className="sn-md" options={{ forceBlock: true }}>
+              {overview}
+            </Markdown>
+          </div>
+        )
+      )}
+
       {memory?.structured?.action_items?.length > 0 && (
-        <ActionItems items={memory.structured.action_items} />
+        <div className="sn-block">
+          <ActionItems items={memory.structured.action_items} />
+        </div>
       )}
+
+      {/* Keyed so client navigation between shares never carries state across. */}
+      <ScreenMoments
+        key={memory.id}
+        conversationId={memory.id}
+        initial={screenshots}
+        startedAt={memory.started_at}
+      />
+
       {memory?.structured?.events?.length > 0 && (
-        <MemoryEvents events={memory.structured.events} />
+        <div className="sn-block">
+          <MemoryEvents events={memory.structured.events} />
+        </div>
       )}
-      {memory.plugins_results.length > 0 && <Plugins plugins={memory.plugins_results} />}
+
+      {memory.apps_results.length > 0 && (
+        <div className="sn-block">
+          <Plugins apps={memory.apps_results} />
+        </div>
+      )}
     </div>
   );
 }

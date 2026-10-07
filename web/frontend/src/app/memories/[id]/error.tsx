@@ -1,20 +1,28 @@
 'use client';
 
-export default function Error() {
-  console.log('Memory not found');
+import './share-note.css';
+
+/** A shared note that failed to render (network or server error, not a missing note). */
+export default function Error({ reset }: { error: Error; reset: () => void }) {
   return (
-    <div className="mx-auto my-28 max-w-screen-md rounded-2xl border border-solid border-zinc-800 px-12 py-12 text-white">
-      <h1 className="font-semibolds text-xl">Memory not found</h1>
-      <p className="mt-3 text-lg text-zinc-400">
-        The memory you are looking for does not exist. Please check the URL and try again.
-      </p>
-      {/* <Link
-        href="/memories"
-        className="mt-3 flex w-fit items-center gap-1.5 rounded-md text-white transition-colors hover:underline"
-      >
-        <NavArrowLeft className="-ml-1.5 inline-block text-sm" />
-        Back to Memories
-      </Link> */}
+    <div className="share-note">
+      <section className="sn-page sn-notfound">
+        <p className="sn-eyebrow">Shared from Omi</p>
+        <h1 className="sn-title">This note didn&apos;t load</h1>
+        <p className="sn-notfound-copy">
+          Something went wrong on our side. Try again in a moment.
+        </p>
+        <div
+          style={{ marginTop: 28, display: 'flex', justifyContent: 'center', gap: 12 }}
+        >
+          <button type="button" className="sn-pill" onClick={() => reset()}>
+            Try again
+          </button>
+          <a href="https://omi.me" className="sn-pill sn-pill-ghost">
+            Go to omi.me
+          </a>
+        </div>
+      </section>
     </div>
   );
 }

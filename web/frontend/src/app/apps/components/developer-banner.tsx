@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { Code, Sparkles, Zap, ArrowRight } from 'lucide-react';
+import { Sparkles, Zap, ArrowRight } from 'lucide-react';
 import { useState, useEffect } from 'react';
 
 export const DeveloperBanner = () => {
@@ -23,12 +23,12 @@ export const DeveloperBanner = () => {
       setCodeStep((prev) => (prev + 1) % codeLines.length);
     }, 1200);
     return () => clearInterval(interval);
-  }, []);
+  }, [codeLines.length]);
 
   return (
     <div className="container mx-auto px-3 sm:px-6 md:px-8">
       <Link
-        href="https://docs.omi.me/docs/developer/apps/Introduction"
+        href="https://docs.omi.me/doc/developer/apps/Introduction"
         target="_blank"
         className="group block w-full transform transition-transform duration-300 hover:scale-[1.01]"
       >
@@ -52,10 +52,11 @@ export const DeveloperBanner = () => {
                 Start Building Your Own Apps
               </h3>
               <p className="mt-2 text-sm text-purple-100 sm:text-base">
-                Create powerful AI-powered apps for Omi and start earning. Join our developer community today!
+                Create powerful AI-powered apps for Omi and start earning. Join our
+                developer community today!
               </p>
             </div>
-            
+
             {/* Middle - Code typing animation */}
             <div className="mt-4 hidden sm:mt-0 sm:block sm:max-w-md sm:flex-1">
               <div className="h-[9.5rem] overflow-hidden rounded-md bg-black/30 p-3 font-mono text-xs text-purple-200/90 backdrop-blur-sm">
@@ -69,13 +70,17 @@ export const DeveloperBanner = () => {
                     </div>
                   ))}
                   {/* Empty lines to maintain height */}
-                  {Array(9 - codeStep).fill(0).map((_, i) => (
-                    <div key={`empty-${i}`} className="whitespace-pre">&nbsp;</div>
-                  ))}
+                  {Array(9 - codeStep)
+                    .fill(0)
+                    .map((_, i) => (
+                      <div key={`empty-${i}`} className="whitespace-pre">
+                        &nbsp;
+                      </div>
+                    ))}
                 </div>
               </div>
             </div>
-            
+
             {/* Right - Button */}
             <div className="mt-4 flex items-center sm:ml-4 sm:mt-0">
               <div className="flex items-center gap-1.5 rounded-full bg-black/80 px-4 py-2 text-sm font-medium text-purple-200 shadow-sm transition-all duration-300 group-hover:bg-black group-hover:shadow-md group-hover:shadow-purple-900/30">
@@ -92,4 +97,4 @@ export const DeveloperBanner = () => {
       </Link>
     </div>
   );
-}; 
+};

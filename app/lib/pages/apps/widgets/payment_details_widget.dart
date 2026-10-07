@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
-import '../providers/add_app_provider.dart';
+import 'package:omi/pages/apps/providers/add_app_provider.dart';
+import 'package:omi/ui/ui.dart';
+import 'package:omi/utils/l10n_extensions.dart';
 
 class PaymentDetailsWidget extends StatelessWidget {
   final TextEditingController appPricingController;
@@ -18,38 +20,30 @@ class PaymentDetailsWidget extends StatelessWidget {
       child: Padding(
         padding: const EdgeInsets.only(top: 12.0),
         child: Container(
-          decoration: BoxDecoration(
-            color: Colors.grey.shade900,
-            borderRadius: BorderRadius.circular(12.0),
-          ),
+          decoration: BoxDecoration(color: OmiColors.surface1, borderRadius: OmiRadius.mdAll),
           padding: const EdgeInsets.all(14.0),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Padding(
                 padding: const EdgeInsets.only(left: 8.0),
-                child: Text(
-                  'App Cost',
-                  style: TextStyle(color: Colors.grey.shade300, fontSize: 16),
-                ),
+                child:
+                    Text(context.l10n.paymentAppCost, style: OmiType.callout.copyWith(color: OmiColors.textSecondary)),
               ),
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 12.0, vertical: 6.0),
                 margin: const EdgeInsets.only(left: 2.0, right: 2.0, top: 10, bottom: 6),
-                decoration: BoxDecoration(
-                  color: Colors.grey.shade800,
-                  borderRadius: BorderRadius.circular(10.0),
-                ),
+                decoration: BoxDecoration(color: OmiColors.surface2, borderRadius: OmiRadius.mdAll),
                 width: double.infinity,
                 child: TextFormField(
                   keyboardType: TextInputType.number,
                   validator: (value) {
                     if (value != null && value.isNotEmpty) {
                       if (double.tryParse(value) == null) {
-                        return 'Please enter a valid amount';
+                        return context.l10n.paymentEnterValidAmount;
                       }
                       if (double.parse(value) < 1) {
-                        return 'Please enter an amount greater than 0';
+                        return context.l10n.paymentEnterAmountGreaterThanZero;
                       }
                       return null;
                     } else {
@@ -58,16 +52,10 @@ class PaymentDetailsWidget extends StatelessWidget {
                   },
                   controller: appPricingController,
                   decoration: InputDecoration(
-                    prefixIconConstraints: const BoxConstraints(
-                      maxHeight: 28,
-                      maxWidth: 28,
-                    ),
+                    prefixIconConstraints: const BoxConstraints(maxHeight: 28, maxWidth: 28),
                     prefixIcon: Padding(
                       padding: const EdgeInsets.only(right: 4.0),
-                      child: Text(
-                        '\$',
-                        style: TextStyle(color: Colors.grey.shade300, fontSize: 17),
-                      ),
+                      child: Text('\$', style: OmiType.body.copyWith(color: OmiColors.textSecondary)),
                     ),
                     errorText: null,
                     isDense: true,
@@ -76,122 +64,31 @@ class PaymentDetailsWidget extends StatelessWidget {
                   ),
                 ),
               ),
-              const SizedBox(
-                height: 16,
-              ),
+              const SizedBox(height: 16),
               Padding(
                 padding: const EdgeInsets.only(left: 8.0),
-                child: Text(
-                  'Payment Plan',
-                  style: TextStyle(color: Colors.grey.shade300, fontSize: 16),
-                ),
+                child: Text(context.l10n.paymentPlan, style: OmiType.callout.copyWith(color: OmiColors.textSecondary)),
               ),
               GestureDetector(
-                onTap: () {
-                  showModalBottomSheet(
-                    context: context,
-                    isScrollControlled: true,
-                    shape: const RoundedRectangleBorder(
-                      borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-                    ),
-                    builder: (context) {
-                      return Consumer<AddAppProvider>(builder: (context, provider, child) {
-                        return Container(
-                          padding: const EdgeInsets.all(16.0),
-                          height: MediaQuery.of(context).size.height * 0.3,
-                          child: SingleChildScrollView(
-                            child: Column(
-                              mainAxisSize: MainAxisSize.min,
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                const SizedBox(
-                                  height: 12,
-                                ),
-                                const Text(
-                                  'Payment Plan',
-                                  style: TextStyle(color: Colors.white, fontSize: 18),
-                                ),
-                                const SizedBox(
-                                  height: 18,
-                                ),
-                                ListView.separated(
-                                  separatorBuilder: (context, index) {
-                                    return Divider(
-                                      color: Colors.grey.shade600,
-                                      height: 1,
-                                    );
-                                  },
-                                  shrinkWrap: true,
-                                  itemCount: provider.paymentPlans.length,
-                                  physics: const NeverScrollableScrollPhysics(),
-                                  itemBuilder: (context, index) {
-                                    return InkWell(
-                                      onTap: () {
-                                        provider.setPaymentPlan(provider.paymentPlans[index].id);
-                                        Navigator.pop(context);
-                                      },
-                                      child: Container(
-                                        padding: const EdgeInsets.symmetric(vertical: 10),
-                                        child: Row(
-                                          crossAxisAlignment: CrossAxisAlignment.center,
-                                          children: [
-                                            const SizedBox(
-                                              width: 6,
-                                            ),
-                                            Text(
-                                              provider.paymentPlans[index].title,
-                                              style: TextStyle(color: Colors.grey.shade300, fontSize: 16),
-                                            ),
-                                            const Spacer(),
-                                            Checkbox(
-                                              value: provider.selectePaymentPlan == provider.paymentPlans[index].id,
-                                              onChanged: (value) {
-                                                provider.setPaymentPlan(provider.paymentPlans[index].id);
-                                                Navigator.pop(context);
-                                              },
-                                              side: BorderSide(color: Colors.grey.shade300),
-                                              shape: const CircleBorder(),
-                                            ),
-                                          ],
-                                        ),
-                                      ),
-                                    );
-                                  },
-                                ),
-                              ],
-                            ),
-                          ),
-                        );
-                      });
-                    },
-                  );
-                },
+                onTap: () => _showPlanPicker(context),
                 child: Container(
                   margin: const EdgeInsets.only(left: 2.0, right: 2.0, top: 10, bottom: 6),
                   padding: const EdgeInsets.symmetric(horizontal: 2.0, vertical: 10.0),
-                  decoration: BoxDecoration(
-                    color: Colors.grey.shade800,
-                    borderRadius: BorderRadius.circular(10.0),
-                  ),
+                  decoration: BoxDecoration(color: OmiColors.surface2, borderRadius: OmiRadius.mdAll),
                   width: double.infinity,
                   child: Row(
                     children: [
-                      const SizedBox(
-                        width: 12,
-                      ),
+                      const SizedBox(width: 12),
                       Text(
-                        (paymentPlan?.isNotEmpty == true ? paymentPlan : 'None Selected') ?? 'None Selected',
-                        style: TextStyle(
-                            color: paymentPlan != null ? Colors.grey.shade100 : Colors.grey.shade400, fontSize: 16),
+                        (paymentPlan?.isNotEmpty == true ? paymentPlan : context.l10n.paymentNoneSelected) ??
+                            context.l10n.paymentNoneSelected,
+                        style: OmiType.callout.copyWith(
+                          color: paymentPlan != null ? OmiColors.textPrimary : OmiColors.textTertiary,
+                        ),
                       ),
                       const Spacer(),
-                      Icon(
-                        Icons.arrow_forward_ios_rounded,
-                        color: Colors.grey.shade400,
-                      ),
-                      const SizedBox(
-                        width: 12,
-                      ),
+                      Icon(Icons.arrow_forward_ios_rounded, color: OmiColors.textTertiary),
+                      const SizedBox(width: 12),
                     ],
                   ),
                 ),
@@ -199,6 +96,50 @@ class PaymentDetailsWidget extends StatelessWidget {
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  void _showPlanPicker(BuildContext context) {
+    showOmiSheet<void>(
+      context: context,
+      title: context.l10n.paymentPlan,
+      builder: (context) => Consumer<AddAppProvider>(
+        builder: (context, provider, child) {
+          return ListView.separated(
+            shrinkWrap: true,
+            itemCount: provider.paymentPlans.length,
+            separatorBuilder: (context, index) => Divider(color: OmiColors.border, height: 1),
+            itemBuilder: (context, index) {
+              final plan = provider.paymentPlans[index];
+              void select() {
+                provider.setPaymentPlan(plan.id);
+                Navigator.pop(context);
+              }
+
+              return InkWell(
+                onTap: select,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 10),
+                  child: Row(
+                    children: [
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(plan.title, style: OmiType.callout.copyWith(color: OmiColors.textSecondary)),
+                      ),
+                      Checkbox(
+                        value: provider.selectePaymentPlan == plan.id,
+                        onChanged: (_) => select(),
+                        side: BorderSide(color: OmiColors.textSecondary),
+                        shape: const CircleBorder(),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          );
+        },
       ),
     );
   }

@@ -1,269 +1,118 @@
-import 'package:cached_network_image/cached_network_image.dart';
-import 'package:collection/collection.dart';
+import 'package:omi/utils/platform/platform_manager.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:gradient_borders/box_borders/gradient_box_border.dart';
-import 'package:omi/backend/http/api/conversations.dart';
-import 'package:omi/backend/http/webhooks.dart';
-import 'package:omi/backend/preferences.dart';
+
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:provider/provider.dart';
+
 import 'package:omi/backend/schema/app.dart';
 import 'package:omi/backend/schema/conversation.dart';
 import 'package:omi/backend/schema/geolocation.dart';
-import 'package:omi/backend/schema/structured.dart';
-import 'package:omi/gen/assets.gen.dart';
+import 'package:omi/l10n/app_localizations.dart';
+import 'package:omi/utils/l10n_extensions.dart';
 import 'package:omi/pages/apps/app_detail/app_detail.dart';
-import 'package:omi/pages/chat/widgets/markdown_message_widget.dart';
 import 'package:omi/pages/conversation_detail/conversation_detail_provider.dart';
-import 'package:omi/pages/conversation_detail/test_prompts.dart';
+import 'package:omi/pages/conversation_detail/conversation_summary_selection.dart';
+import 'package:omi/pages/conversation_detail/widgets/conversation_markdown_widget.dart';
 import 'package:omi/pages/conversation_detail/widgets/summarized_apps_sheet.dart';
-import 'package:omi/pages/settings/developer.dart';
-import 'package:omi/providers/connectivity_provider.dart';
-import 'package:omi/providers/conversation_provider.dart';
-import 'package:omi/utils/analytics/mixpanel.dart';
+import 'package:omi/ui/ui.dart';
 import 'package:omi/utils/other/temp.dart';
-import 'package:omi/utils/other/time_utils.dart';
-import 'package:omi/widgets/dialog.dart';
 import 'package:omi/widgets/extensions/string.dart';
-import 'package:provider/provider.dart';
-import 'package:share_plus/share_plus.dart';
-import 'package:tuple/tuple.dart';
-
+import 'package:omi/widgets/omi_map_preview.dart';
 import 'maps_util.dart';
 
-class GetSummaryWidgets extends StatelessWidget {
-  const GetSummaryWidgets({super.key});
-
-  String setTime(DateTime? startedAt, DateTime createdAt, DateTime? finishedAt) {
-    return startedAt == null
-        ? dateTimeFormat('h:mm a', createdAt)
-        : '${dateTimeFormat('h:mm a', startedAt)} to ${dateTimeFormat('h:mm a', finishedAt)}';
-  }
-
-  String setTimeSDCard(DateTime? startedAt, DateTime createdAt) {
-    return startedAt == null ? dateTimeFormat('h:mm a', createdAt) : dateTimeFormat('h:mm a', startedAt);
-  }
-
-  String _getDuration(ServerConversation conversation) {
-    if (conversation.transcriptSegments.isEmpty) return '';
-
-    int durationSeconds = conversation.getDurationInSeconds();
-    if (durationSeconds <= 0) return '';
-
-    return secondsToHumanReadable(durationSeconds);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Selector<ConversationDetailProvider, Tuple3<ServerConversation, TextEditingController?, FocusNode?>>(
-      selector: (context, provider) => Tuple3(provider.conversation, provider.titleController, provider.titleFocusNode),
-      builder: (context, data, child) {
-        ServerConversation conversation = data.item1;
-        return Column(
-          mainAxisAlignment: MainAxisAlignment.start,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const SizedBox(height: 24),
-            conversation.discarded
-                ? Text(
-                    'Discarded Conversation',
-                    style: Theme.of(context).textTheme.titleLarge!.copyWith(fontSize: 32),
-                  )
-                : GetEditTextField(
-                    conversationId: conversation.id,
-                    focusNode: data.item3,
-                    controller: data.item2,
-                    content: conversation.structured.title.decodeString,
-                    style: Theme.of(context).textTheme.titleLarge!.copyWith(fontSize: 32, color: Colors.white),
-                  ),
-            const SizedBox(height: 16),
-            Text(
-              conversation.source == ConversationSource.sdcard
-                  ? 'Imported at ${dateTimeFormat('MMM d,  yyyy', conversation.createdAt)}, ${setTimeSDCard(conversation.startedAt, conversation.createdAt)}'
-                  : '${dateTimeFormat('MMM d,  yyyy', conversation.createdAt)} ${conversation.startedAt == null ? 'at' : 'from'} ${setTime(conversation.startedAt, conversation.createdAt, conversation.finishedAt)}',
-              style: const TextStyle(color: Colors.grey, fontSize: 16),
-            ),
-            if (conversation.transcriptSegments.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(top: 4.0),
-                child: Row(
-                  children: [
-                    const Icon(Icons.access_time, color: Colors.grey, size: 14),
-                    const SizedBox(width: 4),
-                    Text(
-                      'Duration: ${_getDuration(conversation)}',
-                      style: const TextStyle(color: Colors.grey, fontSize: 14),
-                    ),
-                  ],
-                ),
-              ),
-            const SizedBox(height: 16),
-            conversation.discarded ? const SizedBox.shrink() : const SizedBox(height: 8),
-          ],
-        );
-      },
-    );
-  }
+/// The detail page's length label: the same rule and format as the conversation list row
+/// ([ServerConversation.getDurationInSeconds], [OmiDuration.compact]), so both always agree.
+/// Empty when there is no measurable length.
+String conversationDurationLabel(ServerConversation conversation, [AppLocalizations? l10n]) {
+  final seconds = conversation.getDurationInSeconds();
+  if (seconds <= 0) return '';
+  return OmiDuration.compact(seconds, l10n);
 }
 
-class ActionItemsListWidget extends StatelessWidget {
-  const ActionItemsListWidget({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return Consumer<ConversationDetailProvider>(builder: (context, provider, child) {
-      return Column(
-        children: [
-          provider.conversation.structured.actionItems.isNotEmpty
-              ? Row(
-                  crossAxisAlignment: CrossAxisAlignment.center,
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Text(
-                      'Action Items',
-                      style: Theme.of(context).textTheme.titleLarge!.copyWith(fontSize: 26),
-                    ),
-                    IconButton(
-                      onPressed: () {
-                        Clipboard.setData(ClipboardData(
-                          text:
-                              '- ${provider.conversation.structured.actionItems.map((e) => e.description.decodeString).join('\n- ')}',
-                        ));
-                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                          content: Text('Action items copied to clipboard'),
-                          duration: Duration(seconds: 2),
-                        ));
-                        MixpanelManager().copiedConversationDetails(provider.conversation, source: 'Action Items');
-                      },
-                      icon: const Icon(Icons.copy_rounded, color: Colors.white, size: 20),
-                    )
-                  ],
-                )
-              : const SizedBox.shrink(),
-          ListView.builder(
-            itemCount: provider.conversation.structured.actionItems.where((e) => !e.deleted).length,
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            itemBuilder: (context, idx) {
-              var item = provider.conversation.structured.actionItems.where((e) => !e.deleted).toList()[idx];
-              return Dismissible(
-                key: Key(item.description),
-                direction: DismissDirection.endToStart,
-                background: Container(
-                  alignment: Alignment.centerRight,
-                  padding: const EdgeInsets.only(right: 20.0),
-                  color: Colors.red,
-                  child: const Icon(Icons.delete, color: Colors.white),
-                ),
-                onDismissed: (direction) {
-                  var tempItem = provider.conversation.structured.actionItems[idx];
-                  var tempIdx = idx;
-                  provider.deleteActionItem(idx);
-                  provider.deleteActionItemPermanently(tempItem, tempIdx);
-                  MixpanelManager().deletedActionItem(provider.conversation);
-                  // ScaffoldMessenger.of(context)
-                  //     .showSnackBar(
-                  //       SnackBar(
-                  //         content: const Text('Action Item deleted successfully 🗑️'),
-                  //         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
-                  //         action: SnackBarAction(
-                  //           label: 'Undo',
-                  //           textColor: Colors.white,
-                  //           onPressed: () {
-                  //             provider.undoDeleteActionItem(idx);
-                  //           },
-                  //         ),
-                  //       ),
-                  //     )
-                  //     .closed
-                  //     .then((reason) {
-                  //   if (reason != SnackBarClosedReason.action) {
-                  //     provider.deleteActionItemPermanently(tempItem, tempIdx);
-                  //     MixpanelManager().deletedActionItem(provider.conversation);
-                  //   }
-                  // });
-                },
-                child: Padding(
-                  padding: const EdgeInsets.only(top: 10, bottom: 2),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Padding(
-                        padding: const EdgeInsets.only(top: 6.0),
-                        child: SizedBox(
-                          height: 22.0,
-                          width: 22.0,
-                          child: Checkbox(
-                            shape: const CircleBorder(),
-                            value: item.completed,
-                            onChanged: (value) {
-                              if (value != null) {
-                                context.read<ConversationDetailProvider>().updateActionItemState(value, idx);
-                                setConversationActionItemState(provider.conversation.id, [idx], [value]);
-                                if (value) {
-                                  MixpanelManager().checkedActionItem(provider.conversation, idx);
-                                } else {
-                                  MixpanelManager().uncheckedActionItem(provider.conversation, idx);
-                                }
-                              }
-                            },
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: SelectionArea(
-                          child: Text(
-                            item.description.decodeString,
-                            style: TextStyle(color: Colors.grey.shade300, fontSize: 16, height: 1.3),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              );
-            },
-          ),
-        ],
-      );
-    });
-  }
-}
-
-class GetEditTextField extends StatefulWidget {
-  final String conversationId;
-  final String content;
+/// The conversation title, edited in place.
+///
+/// Up to three lines at the page's title size, with a Done key; an empty title shows the "Untitled
+/// Conversation" placeholder. The edit is saved when editing ends — Done, or tapping away — and the
+/// outcome is announced ("Saved" / an error that restores the old title). Blank or unchanged text is
+/// not saved.
+class ConversationTitleField extends StatefulWidget {
   final TextStyle style;
   final TextEditingController? controller;
   final FocusNode? focusNode;
 
-  const GetEditTextField({
+  /// Shown while the title is empty; "Untitled Conversation" when null.
+  final String? hintText;
+
+  const ConversationTitleField({
     super.key,
-    required this.content,
     required this.style,
-    required this.conversationId,
     required this.controller,
     required this.focusNode,
+    this.hintText,
   });
 
   @override
-  State<GetEditTextField> createState() => _GetEditTextFieldState();
+  State<ConversationTitleField> createState() => _ConversationTitleFieldState();
 }
 
-class _GetEditTextFieldState extends State<GetEditTextField> {
+class _ConversationTitleFieldState extends State<ConversationTitleField> {
+  @override
+  void initState() {
+    super.initState();
+    widget.focusNode?.addListener(_onFocusChanged);
+  }
+
+  @override
+  void didUpdateWidget(ConversationTitleField oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.focusNode != widget.focusNode) {
+      oldWidget.focusNode?.removeListener(_onFocusChanged);
+      widget.focusNode?.addListener(_onFocusChanged);
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.focusNode?.removeListener(_onFocusChanged);
+    super.dispose();
+  }
+
+  void _onFocusChanged() {
+    if (widget.focusNode?.hasFocus ?? true) return;
+    _save();
+  }
+
+  Future<void> _save() async {
+    final controller = widget.controller;
+    if (controller == null) return;
+    final l10n = context.l10n;
+    final saved = await context.read<ConversationDetailProvider>().saveTitle(controller.text);
+    if (!mounted || saved == null) return;
+    if (saved) {
+      OmiFeedback.confirm(context, l10n.saved);
+    } else {
+      OmiFeedback.error(context, l10n.failedToUpdateConversationTitle);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return TextField(
-      keyboardType: TextInputType.multiline,
+      keyboardType: TextInputType.text,
+      textInputAction: TextInputAction.done,
       minLines: 1,
       maxLines: 3,
       focusNode: widget.focusNode,
-      decoration: const InputDecoration(
-        border: OutlineInputBorder(borderSide: BorderSide.none),
-        contentPadding: EdgeInsets.all(0),
-      ),
       controller: widget.controller,
-      enabled: true,
+      onSubmitted: (_) => widget.focusNode?.unfocus(),
+      decoration: InputDecoration(
+        border: const OutlineInputBorder(borderSide: BorderSide.none),
+        contentPadding: EdgeInsets.zero,
+        isDense: true,
+        hintText: widget.hintText ?? context.l10n.untitledConversation,
+        hintMaxLines: 1,
+        hintStyle: widget.style.copyWith(color: OmiColors.textTertiary),
+      ),
       style: widget.style,
     );
   }
@@ -274,329 +123,325 @@ class ReprocessDiscardedWidget extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Consumer<ConversationDetailProvider>(builder: (context, provider, child) {
-      if (provider.loadingReprocessConversation && provider.reprocessConversationId == provider.conversation.id) {
-        return Center(
-          child: Padding(
+    return Consumer<ConversationDetailProvider>(
+      builder: (context, provider, child) {
+        if (provider.loadingReprocessConversation && provider.reprocessConversationId == provider.conversation.id) {
+          return Padding(
             padding: const EdgeInsets.only(top: 18.0),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              crossAxisAlignment: CrossAxisAlignment.center,
-              children: [
-                const CircularProgressIndicator(
-                  valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                ),
-                const SizedBox(width: 16),
-                Text(
-                  '${provider.conversation.discarded ? 'Summarizing' : 'Re-summarizing'} conversation...\nThis may take a few seconds',
-                  style: const TextStyle(color: Colors.white, fontSize: 16),
-                ),
-              ],
+            child: OmiLoadingState(
+              label: provider.conversation.discarded
+                  ? context.l10n.summarizingConversation
+                  : context.l10n.resummarizingConversation,
             ),
-          ),
+          );
+        }
+        return _SummaryCallToAction(
+          message: context.l10n.nothingInterestingRetry,
+          actionLabel: context.l10n.summarize,
+          onPressed: () => provider.reprocessConversation(),
         );
-      }
-      return ListView(
-        shrinkWrap: true,
-        children: [
-          const SizedBox(height: 32),
-          Text(
-            'Nothing interesting found,\nwant to retry?',
-            style: Theme.of(context).textTheme.titleLarge!.copyWith(fontSize: 20),
-            textAlign: TextAlign.center,
-          ),
-          const SizedBox(height: 24),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Container(
-                decoration: BoxDecoration(
-                  border: const GradientBoxBorder(
-                    gradient: LinearGradient(colors: [
-                      Color.fromARGB(127, 208, 208, 208),
-                      Color.fromARGB(127, 188, 99, 121),
-                      Color.fromARGB(127, 86, 101, 182),
-                      Color.fromARGB(127, 126, 190, 236)
-                    ]),
-                    width: 2,
-                  ),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: MaterialButton(
-                  onPressed: () async {
-                    await provider.reprocessConversation();
-                  },
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                  child: const Padding(
-                      padding: EdgeInsets.symmetric(horizontal: 16, vertical: 0),
-                      child: Text('Summarize', style: TextStyle(color: Colors.white, fontSize: 16))),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 32),
-        ],
-      );
-    });
+      },
+    );
   }
 }
 
-class AppResultDetailWidget extends StatelessWidget {
-  final AppResponse appResponse;
-  final App? app;
-  final ServerConversation conversation;
-
-  const AppResultDetailWidget({
-    super.key,
-    required this.appResponse,
-    required this.app,
-    required this.conversation,
-  });
+/// "Summary failed" with Retry, for a row the server marked retryable: its summary pass failed on
+/// a transient error, so a reprocess can still succeed. Success replaces the conversation, which
+/// clears the marker and removes this widget.
+class SummaryRetryWidget extends StatelessWidget {
+  const SummaryRetryWidget({super.key});
 
   @override
   Widget build(BuildContext context) {
-    final String content = appResponse.content.trim().decodeString;
+    return Consumer<ConversationDetailProvider>(
+      builder: (context, provider, child) {
+        if (provider.loadingReprocessConversation && provider.reprocessConversationId == provider.conversation.id) {
+          return Padding(
+            padding: const EdgeInsets.only(top: 18.0),
+            child: OmiLoadingState(label: context.l10n.summarizingConversation),
+          );
+        }
+        return _SummaryCallToAction(
+          key: const Key('conversation_detail_summary_retry'),
+          message: context.l10n.conversationSummaryFailed,
+          actionLabel: context.l10n.retry,
+          onPressed: () => provider.reprocessConversation(),
+        );
+      },
+    );
+  }
+}
 
-    return Container(
-      margin: const EdgeInsets.only(bottom: 20),
+/// A centred sentence with one secondary button under it ("Summarize", "Generate Summary").
+class _SummaryCallToAction extends StatelessWidget {
+  const _SummaryCallToAction({super.key, required this.message, required this.actionLabel, required this.onPressed});
+
+  final String message;
+  final String actionLabel;
+  final Future<void> Function() onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: OmiSpacing.xxl),
       child: Column(
-        mainAxisAlignment: MainAxisAlignment.start,
-        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Padding(
-            padding: const EdgeInsets.symmetric(vertical: 8),
-            child: content.isEmpty
-                ? Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Expanded(
-                        child: GestureDetector(
-                          onTap: () {
-                            showModalBottomSheet(
-                              context: context,
-                              isScrollControlled: true,
-                              backgroundColor: Colors.transparent,
-                              builder: (context) => const SummarizedAppsBottomSheet(),
-                            );
-                          },
-                          child: RichText(
-                            text: const TextSpan(
-                                style: TextStyle(color: Colors.grey),
-                                text: "No summary available for this app. Try another app for better results."),
-                          ),
-                        ),
-                      ),
-                    ],
-                  )
-                : SelectionArea(
-                    child: getMarkdownWidget(context, content),
-                  ),
-          ),
-
-          // App info in a more subtle format below the content - only show if content is not empty
-          if (content.isNotEmpty)
-            GestureDetector(
-              onTap: () async {
-                if (app != null) {
-                  MixpanelManager().pageOpened('App Detail');
-                  await routeToPage(context, AppDetailPage(app: app!));
-                }
-              },
-              child: Padding(
-                padding: const EdgeInsets.only(top: 12, left: 4),
-                child: Row(
-                  children: [
-                    // App icon
-                    app != null
-                        ? CachedNetworkImage(
-                            imageUrl: app!.getImageUrl(),
-                            imageBuilder: (context, imageProvider) {
-                              return CircleAvatar(
-                                backgroundColor: Colors.white,
-                                radius: 12,
-                                backgroundImage: imageProvider,
-                              );
-                            },
-                            errorWidget: (context, url, error) {
-                              return const CircleAvatar(
-                                backgroundColor: Colors.white,
-                                radius: 12,
-                                child: Icon(Icons.error_outline_rounded, size: 12),
-                              );
-                            },
-                            progressIndicatorBuilder: (context, url, progress) => CircleAvatar(
-                              backgroundColor: Colors.white,
-                              radius: 12,
-                              child: CircularProgressIndicator(
-                                value: progress.progress,
-                                valueColor: const AlwaysStoppedAnimation<Color>(Colors.white),
-                                strokeWidth: 2,
-                              ),
-                            ),
-                          )
-                        : Container(
-                            decoration: BoxDecoration(
-                              image: DecorationImage(
-                                image: AssetImage(Assets.images.background.path),
-                                fit: BoxFit.cover,
-                              ),
-                              borderRadius: const BorderRadius.all(Radius.circular(12.0)),
-                            ),
-                            height: 24,
-                            width: 24,
-                            child: Stack(
-                              alignment: Alignment.center,
-                              children: [
-                                Image.asset(
-                                  Assets.images.herologo.path,
-                                  height: 16,
-                                  width: 16,
-                                ),
-                              ],
-                            ),
-                          ),
-
-                    const SizedBox(width: 8),
-
-                    // App name and description with arrow
-                    Expanded(
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  app != null ? app!.name.decodeString : 'Unknown App',
-                                  maxLines: 1,
-                                  style: const TextStyle(
-                                    fontWeight: FontWeight.w500,
-                                    color: Colors.white,
-                                    fontSize: 14,
-                                  ),
-                                ),
-                                if (app != null)
-                                  Text(
-                                    app!.description.decodeString,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(color: Colors.grey, fontSize: 12),
-                                  ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(
-                            child: Icon(Icons.arrow_forward_ios, color: Colors.white, size: 20),
-                            width: 42,
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
+          Text(message, style: OmiType.title3, textAlign: TextAlign.center),
+          const SizedBox(height: OmiSpacing.xl),
+          OmiButton.secondary(label: actionLabel, onPressed: onPressed),
         ],
       ),
     );
   }
 }
 
+class AppResultDetailWidget extends StatefulWidget {
+  final ConversationSummarySelection summarySelection;
+  final App? app;
+  final ServerConversation conversation;
+  final String searchQuery;
+  final int currentResultIndex;
+  final void Function(ConversationSummarySelection selection, String newContent)? onSaveSummarySelection;
+  final void Function(ConversationSummarySelection selection)? onEditStarted;
+  final void Function(ConversationSummarySelection selection)? onEditCancelled;
+  final bool Function()? canStartEditing;
+  final bool asSliver;
+
+  const AppResultDetailWidget({
+    super.key,
+    required this.summarySelection,
+    required this.app,
+    required this.conversation,
+    this.searchQuery = '',
+    this.currentResultIndex = -1,
+    this.onSaveSummarySelection,
+    this.onEditStarted,
+    this.onEditCancelled,
+    this.canStartEditing,
+    this.asSliver = false,
+  });
+
+  @override
+  State<AppResultDetailWidget> createState() => _AppResultDetailWidgetState();
+}
+
+class _AppResultDetailWidgetState extends State<AppResultDetailWidget> {
+  bool _isEditing = false;
+  TextEditingController? _controller;
+  FocusNode? _focusNode;
+  ConversationSummarySelection? _editingSelection;
+  String? _editingOriginalContent;
+
+  @override
+  void dispose() {
+    _controller?.dispose();
+    _focusNode?.dispose();
+    super.dispose();
+  }
+
+  void _startEditing(String currentContent) {
+    final selection = widget.summarySelection;
+    if (!selection.canEdit(widget.conversation)) return;
+    if (widget.canStartEditing != null && !widget.canStartEditing!()) return;
+    OmiHaptics.medium();
+    final controller = TextEditingController(text: currentContent);
+    final focusNode = FocusNode();
+    setState(() {
+      _controller = controller;
+      _focusNode = focusNode;
+      _isEditing = true;
+      _editingSelection = selection;
+      _editingOriginalContent = currentContent;
+    });
+    widget.onEditStarted?.call(selection);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      focusNode.requestFocus();
+    });
+  }
+
+  void _exitEditing({bool cancelled = false}) {
+    final controller = _controller;
+    final focusNode = _focusNode;
+    final selection = _editingSelection ?? widget.summarySelection;
+    setState(() {
+      _isEditing = false;
+      _controller = null;
+      _focusNode = null;
+      _editingSelection = null;
+      _editingOriginalContent = null;
+    });
+    controller?.dispose();
+    focusNode?.dispose();
+    if (cancelled) widget.onEditCancelled?.call(selection);
+  }
+
+  void _save() {
+    final newContent = _controller?.text.trim() ?? '';
+    final selection = _editingSelection ?? widget.summarySelection;
+    final original = _editingOriginalContent ?? selection.content;
+    if (newContent.isNotEmpty && newContent != original.trim()) {
+      widget.onSaveSummarySelection?.call(selection, newContent);
+    }
+    _exitEditing();
+  }
+
+  Widget _buildNoSummaryForApp(BuildContext context) {
+    return Semantics(
+      button: true,
+      child: GestureDetector(
+        onTap: () => showSummarizedAppsSheet(context),
+        child: Text(context.l10n.noSummaryForApp, style: OmiType.subhead.copyWith(color: OmiColors.textTertiary)),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final selection = widget.summarySelection;
+    final String content = selection.content.decodeString;
+
+    if (widget.asSliver) {
+      return _buildSliver(context, content, selection);
+    }
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: OmiSpacing.lg),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: OmiSpacing.xs),
+            child: content.isEmpty
+                ? _buildNoSummaryForApp(context)
+                : _isEditing
+                    ? _buildEditor(context)
+                    : GestureDetector(
+                        onDoubleTap: widget.onSaveSummarySelection == null || !selection.canEdit(widget.conversation)
+                            ? null
+                            : () => _startEditing(content),
+                        child: ConversationMarkdownWidget(
+                          content: content,
+                          searchQuery: widget.searchQuery,
+                          currentResultIndex: widget.currentResultIndex,
+                        ),
+                      ),
+          ),
+          if (content.isNotEmpty && !_isEditing && widget.app != null) _buildAppAttribution(context, widget.app!),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEditor(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        TextField(
+          controller: _controller,
+          focusNode: _focusNode,
+          minLines: 6,
+          maxLines: 12,
+          maxLength: 10000,
+          style: OmiType.callout.copyWith(height: 1.5),
+          decoration: InputDecoration(
+            filled: true,
+            fillColor: OmiColors.surface1,
+            border: const OutlineInputBorder(borderRadius: OmiRadius.mdAll, borderSide: BorderSide.none),
+            contentPadding: const EdgeInsets.all(14),
+            counterStyle: OmiType.caption.copyWith(color: OmiColors.textTertiary),
+          ),
+        ),
+        const SizedBox(height: OmiSpacing.sm),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.end,
+          children: [
+            OmiButton.tertiary(
+              label: context.l10n.cancel,
+              size: OmiButtonSize.compact,
+              onPressed: () => _exitEditing(cancelled: true),
+            ),
+            const SizedBox(width: OmiSpacing.xs),
+            OmiButton(label: context.l10n.save, size: OmiButtonSize.compact, onPressed: _save),
+          ],
+        ),
+      ],
+    );
+  }
+}
+
 class GetAppsWidgets extends StatelessWidget {
-  const GetAppsWidgets({super.key});
+  final String searchQuery;
+  final int currentResultIndex;
+  final void Function(ConversationSummarySelection selection, String newContent)? onSaveSummarySelection;
+  final void Function(ConversationSummarySelection selection)? onEditStarted;
+  final void Function(ConversationSummarySelection selection)? onEditCancelled;
+  final bool Function()? canStartEditing;
+  const GetAppsWidgets({
+    super.key,
+    this.searchQuery = '',
+    this.currentResultIndex = -1,
+    this.onSaveSummarySelection,
+    this.onEditStarted,
+    this.onEditCancelled,
+    this.canStartEditing,
+  });
 
   @override
   Widget build(BuildContext context) {
     return Consumer<ConversationDetailProvider>(
       builder: (context, provider, child) {
-        final summarizedApp = provider.getSummarizedApp();
-        return Column(
-          mainAxisSize: MainAxisSize.min,
-          mainAxisAlignment: MainAxisAlignment.start,
-          crossAxisAlignment: summarizedApp == null ? CrossAxisAlignment.center : CrossAxisAlignment.start,
-          children: summarizedApp == null
-              ? [child!]
-              : [
-                  // Show the summarized app
-                  if (!provider.conversation.discarded) ...[
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Text(
-                          'Summary',
-                          style: Theme.of(context).textTheme.titleLarge!.copyWith(fontSize: 20),
-                          textAlign: TextAlign.start,
-                        ),
-                        IconButton(
-                          icon: const Icon(Icons.copy_rounded, color: Colors.white, size: 20),
-                          onPressed: () {
-                            final String content = summarizedApp.content.decodeString;
-                            Clipboard.setData(ClipboardData(text: content));
-                            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                              content: Text('Summary copied to clipboard'),
-                              duration: Duration(seconds: 1),
-                            ));
-                            MixpanelManager().copiedConversationDetails(provider.conversation, source: 'App Response');
-                          },
-                        ),
-                      ],
-                    ),
-                    AppResultDetailWidget(
-                      appResponse: summarizedApp,
-                      app: provider.appsList.firstWhereOrNull((element) => element.id == summarizedApp.appId),
-                      conversation: provider.conversation,
-                    ),
-                  ],
-                  const SizedBox(height: 8)
-                ],
+        final selection = provider.getSummarySelection();
+        if (selection.kind == ConversationSummaryKind.empty) {
+          final conversation = provider.conversation;
+          // A failed processing pass can be retried the same way as a failed summary.
+          if (conversation.showsSummaryRetry ||
+              (conversation.status == ConversationStatus.failed && !conversation.discarded && !conversation.isLocked)) {
+            return const SliverToBoxAdapter(child: SummaryRetryWidget());
+          }
+          // "Generate Summary" would start a second run while one is already producing it.
+          if (provider.isReprocessingOpenConversation) {
+            return SliverToBoxAdapter(
+              child: Padding(
+                padding: const EdgeInsets.only(top: 18.0),
+                child: OmiLoadingState(label: context.l10n.summarizingConversation),
+              ),
+            );
+          }
+          if (conversation.status == ConversationStatus.processing) {
+            return SliverToBoxAdapter(
+              child: Padding(
+                padding: const EdgeInsets.only(top: 18.0),
+                child: OmiLoadingState(label: context.l10n.processingConversationProgress),
+              ),
+            );
+          }
+          return SliverToBoxAdapter(child: child!);
+        }
+
+        return SliverMainAxisGroup(
+          slivers: [
+            if (!provider.conversation.discarded)
+              AppResultDetailWidget(
+                summarySelection: selection,
+                app: selection.isApp ? provider.findAppById(selection.appId) : null,
+                conversation: provider.conversation,
+                searchQuery: searchQuery,
+                currentResultIndex: currentResultIndex,
+                canStartEditing: canStartEditing,
+                onEditStarted: onEditStarted == null ? null : (_) => onEditStarted!(selection),
+                onEditCancelled: onEditCancelled == null ? null : (_) => onEditCancelled!(selection),
+                onSaveSummarySelection: onSaveSummarySelection,
+                asSliver: true,
+              ),
+            const SliverToBoxAdapter(child: SizedBox(height: OmiSpacing.xs)),
+          ],
         );
       },
-      child: ListView(
-        shrinkWrap: true,
-        physics: const NeverScrollableScrollPhysics(),
-        children: [
-          const SizedBox(height: 32),
-          Text(
-            'No summary available\nfor this conversation.',
-            style: Theme.of(context).textTheme.titleLarge!.copyWith(fontSize: 20),
-            textAlign: TextAlign.center,
-          ),
-          const SizedBox(height: 24),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Container(
-                decoration: BoxDecoration(
-                  border: const GradientBoxBorder(
-                    gradient: LinearGradient(colors: [
-                      Color.fromARGB(127, 208, 208, 208),
-                      Color.fromARGB(127, 188, 99, 121),
-                      Color.fromARGB(127, 86, 101, 182),
-                      Color.fromARGB(127, 126, 190, 236)
-                    ]),
-                    width: 2,
-                  ),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: MaterialButton(
-                  onPressed: () {
-                    showModalBottomSheet(
-                      context: context,
-                      isScrollControlled: true,
-                      backgroundColor: Colors.transparent,
-                      builder: (context) => const SummarizedAppsBottomSheet(),
-                    );
-                  },
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                  child: const Padding(
-                      padding: EdgeInsets.symmetric(horizontal: 16, vertical: 0),
-                      child: Text('Generate Summary', style: TextStyle(color: Colors.white, fontSize: 16))),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 32),
-        ],
+      child: _SummaryCallToAction(
+        message: context.l10n.noSummaryForConversation,
+        actionLabel: context.l10n.generateSummary,
+        onPressed: () => showSummarizedAppsSheet(context),
       ),
     );
   }
@@ -605,528 +450,192 @@ class GetAppsWidgets extends StatelessWidget {
 class GetGeolocationWidgets extends StatelessWidget {
   const GetGeolocationWidgets({super.key});
 
+  // Helper function to shorten address - show only neighborhood/area and city
+  String _getShortAddress(BuildContext context, String? fullAddress) {
+    if (fullAddress == null || fullAddress.isEmpty) {
+      return context.l10n.unknownLocation;
+    }
+
+    // Split address by commas
+    final parts = fullAddress.split(',').map((e) => e.trim()).toList();
+
+    // If address has multiple parts, take the last 2-3 meaningful parts
+    if (parts.length >= 3) {
+      // Take neighborhood/area and city (skip street address and zip code)
+      return '${parts[parts.length - 3]}, ${parts[parts.length - 2]}';
+    } else if (parts.length == 2) {
+      return '${parts[0]}, ${parts[1]}';
+    }
+
+    return fullAddress;
+  }
+
   @override
   Widget build(BuildContext context) {
-    return Selector<ConversationDetailProvider, Geolocation?>(selector: (context, provider) {
-      if (provider.conversation.discarded) return null;
-      return provider.conversation.geolocation;
-    }, builder: (context, geolocation, child) {
-      return Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: geolocation == null
-            ? []
-            : [
-                Text(
-                  'Taken at',
-                  style: Theme.of(context).textTheme.titleLarge!.copyWith(fontSize: 20),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  '${geolocation.address?.decodeString}',
-                  style: TextStyle(color: Colors.grey.shade300),
-                ),
-                const SizedBox(height: 8),
-                GestureDetector(
-                  onTap: () async {
-                    MapsUtil.launchMap(geolocation.latitude!, geolocation.longitude!);
-                  },
-                  child: CachedNetworkImage(
-                    imageBuilder: (context, imageProvider) {
-                      return Container(
-                        margin: const EdgeInsets.only(top: 10, bottom: 8),
-                        height: 200,
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(16),
-                          image: DecorationImage(
-                            image: imageProvider,
-                            fit: BoxFit.cover,
-                          ),
-                        ),
-                      );
+    return Selector<ConversationDetailProvider, Geolocation?>(
+      selector: (context, provider) {
+        if (provider.conversation.discarded) return null;
+        return provider.conversation.geolocation;
+      },
+      builder: (context, geolocation, child) {
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: geolocation == null
+              ? []
+              : [
+                  const SizedBox(height: 12),
+                  GestureDetector(
+                    onTap: () async {
+                      MapsUtil.launchMap(geolocation.latitude!, geolocation.longitude!);
                     },
-                    errorWidget: (context, url, error) {
-                      return Container(
-                        margin: const EdgeInsets.only(top: 10, bottom: 8),
+                    child: ClipRRect(
+                      borderRadius: OmiRadius.lgAll,
+                      child: SizedBox(
                         height: 200,
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(16),
-                          color: Colors.grey.shade800,
+                        child: Stack(
+                          children: [
+                            // Map Image — served by the backend static-map
+                            // proxy through the shared preview widget; offline
+                            // or on failure it renders the pin-dot canvas.
+                            OmiMapPreview(
+                              key: const ValueKey('conversation_location_map'),
+                              pins: [OmiMapPin(latitude: geolocation.latitude!, longitude: geolocation.longitude!)],
+                              backgroundColor: OmiColors.surface2,
+                            ),
+                            // Gradient blur overlay from bottom
+                            Positioned(
+                              bottom: 0,
+                              left: 0,
+                              right: 0,
+                              child: Container(
+                                height: 80,
+                                decoration: BoxDecoration(
+                                  gradient: LinearGradient(
+                                    begin: Alignment.bottomCenter,
+                                    end: Alignment.topCenter,
+                                    colors: [Colors.black.withValues(alpha: 0.6), Colors.black.withValues(alpha: 0.0)],
+                                  ),
+                                ),
+                              ),
+                            ),
+                            // Location text at bottom left
+                            Positioned(
+                              bottom: 16,
+                              left: 16,
+                              right: 16,
+                              child: Text(
+                                _getShortAddress(context, geolocation.address?.decodeString),
+                                style: OmiType.subhead.copyWith(
+                                  fontWeight: FontWeight.w500,
+                                  shadows: const [Shadow(offset: Offset(0, 1), blurRadius: 2, color: Colors.black)],
+                                ),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ],
                         ),
-                        child: const Center(
-                          child: Text(
-                            'Could not load Maps. Please check your internet connection.',
-                            textAlign: TextAlign.center,
-                          ),
-                        ),
-                      );
-                    },
-                    imageUrl: MapsUtil.getMapImageUrl(
-                      geolocation.latitude!,
-                      geolocation.longitude!,
+                      ),
                     ),
                   ),
-                ),
-                const SizedBox(height: 8),
-              ],
-      );
-    });
-  }
-}
-
-///************************************************
-///************ SETTINGS BOTTOM SHEET *************
-///************************************************
-
-class GetSheetTitle extends StatelessWidget {
-  const GetSheetTitle({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return Consumer<ConversationDetailProvider>(builder: (context, provider, child) {
-      return Column(
-        children: [
-          ListTile(
-            title: Text(
-              provider.conversation.discarded ? 'Discarded Conversation' : provider.conversation.structured.title,
-              style: Theme.of(context).textTheme.labelLarge,
-            ),
-            leading: const Icon(Icons.description),
-            trailing: IconButton(
-              icon: const Icon(Icons.cancel_outlined),
-              onPressed: () {
-                Navigator.of(context).pop(true);
-              },
-            ),
-          ),
-          const SizedBox(height: 8),
-        ],
-      );
-    });
-  }
-}
-
-class GetDevToolsOptions extends StatefulWidget {
-  final ServerConversation conversation;
-
-  const GetDevToolsOptions({
-    super.key,
-    required this.conversation,
-  });
-
-  @override
-  State<GetDevToolsOptions> createState() => _GetDevToolsOptionsState();
-}
-
-class _GetDevToolsOptionsState extends State<GetDevToolsOptions> {
-  bool loadingAppIntegrationTest = false;
-
-  void changeLoadingAppIntegrationTest(bool value) {
-    setState(() {
-      loadingAppIntegrationTest = value;
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(children: [
-      Card(
-        shape: const RoundedRectangleBorder(borderRadius: BorderRadius.all(Radius.circular(8))),
-        child: ListTile(
-          title: const Text('Trigger Conversation Created Integration'),
-          leading: loadingAppIntegrationTest
-              ? const SizedBox(
-                  height: 24,
-                  width: 24,
-                  child: CircularProgressIndicator(
-                    valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                  ),
-                )
-              : const Icon(Icons.send_to_mobile_outlined),
-          onTap: () {
-            changeLoadingAppIntegrationTest(true);
-            if (SharedPreferencesUtil().webhookOnConversationCreated.isEmpty) {
-              showDialog(
-                context: context,
-                builder: (c) => getDialog(
-                  context,
-                  () {
-                    Navigator.pop(context);
-                  },
-                  () {
-                    Navigator.pop(context);
-                    routeToPage(context, const DeveloperSettingsPage());
-                  },
-                  'Webhook URL not set',
-                  'Please set the webhook URL in developer settings to use this feature.',
-                  okButtonText: 'Settings',
-                ),
-              );
-              changeLoadingAppIntegrationTest(false);
-              return;
-            } else {
-              webhookOnConversationCreatedCall(widget.conversation, returnRawBody: true).then((response) {
-                showDialog(
-                  context: context,
-                  builder: (c) => getDialog(
-                    context,
-                    () => Navigator.pop(context),
-                    () => Navigator.pop(context),
-                    'Result:',
-                    response,
-                    okButtonText: 'Ok',
-                    singleButton: true,
-                  ),
-                );
-                changeLoadingAppIntegrationTest(false);
-              });
-            }
-          },
-        ),
-      ),
-      Card(
-        shape: const RoundedRectangleBorder(borderRadius: BorderRadius.all(Radius.circular(8))),
-        child: ListTile(
-          title: const Text('Test a Conversation Prompt'),
-          leading: const Icon(Icons.chat),
-          trailing: const Icon(Icons.arrow_forward_ios, size: 20),
-          onTap: () {
-            routeToPage(context, TestPromptsPage(conversation: widget.conversation));
-          },
-        ),
-      ),
-      // widget.memory.postprocessing?.status == MemoryPostProcessingStatus.completed
-      // widget.memory.postprocessing?.status != MemoryPostProcessingStatus.not_started
-      //     ? Card(
-      //         shape: const RoundedRectangleBorder(borderRadius: BorderRadius.all(Radius.circular(8))),
-      //         child: ListTile(
-      //           title: const Text('Compare Transcripts Models'),
-      //           leading: const Icon(Icons.chat),
-      //           trailing: const Icon(Icons.arrow_forward_ios, size: 20),
-      //           onTap: () {
-      //             routeToPage(context, CompareTranscriptsPage(memory: widget.memory));
-      //           },
-      //         ),
-      //       )
-      //     : const SizedBox.shrink(),
-    ]);
-  }
-}
-
-_copyContent(BuildContext context, String content) {
-  Clipboard.setData(ClipboardData(text: content));
-  ScaffoldMessenger.of(context).showSnackBar(
-    const SnackBar(content: Text('Transcript copied to clipboard')),
-  );
-  HapticFeedback.lightImpact();
-  Navigator.pop(context);
-}
-
-_getLoadingIndicator() {
-  return const SizedBox(
-      width: 24,
-      height: 24,
-      child: CircularProgressIndicator(
-        valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-      ));
-}
-
-class GetShareOptions extends StatefulWidget {
-  final ServerConversation conversation;
-
-  const GetShareOptions({
-    super.key,
-    required this.conversation,
-  });
-
-  @override
-  State<GetShareOptions> createState() => _GetShareOptionsState();
-}
-
-class _GetShareOptionsState extends State<GetShareOptions> {
-  bool loadingShareConversationViaURL = false;
-  bool loadingShareTranscript = false;
-  bool loadingShareSummary = false;
-
-  void changeLoadingShareConversationViaURL(bool value) {
-    setState(() {
-      loadingShareConversationViaURL = value;
-    });
-  }
-
-  void changeLoadingShareTranscript(bool value) {
-    setState(() {
-      loadingShareTranscript = value;
-    });
-  }
-
-  void changeLoadingShareSummary(bool value) {
-    setState(() {
-      loadingShareSummary = value;
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      children: [
-        Card(
-          shape: const RoundedRectangleBorder(borderRadius: BorderRadius.all(Radius.circular(8))),
-          child: ListTile(
-            title: const Text('Send web url'),
-            leading: loadingShareConversationViaURL ? _getLoadingIndicator() : const Icon(Icons.link),
-            onTap: () async {
-              if (loadingShareConversationViaURL) return;
-              changeLoadingShareConversationViaURL(true);
-              bool shared = await setConversationVisibility(widget.conversation.id);
-              if (!shared) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Conversation URL could not be shared.')),
-                );
-                return;
-              }
-              String content = '''https://h.omi.me/memories/${widget.conversation.id}'''.replaceAll('  ', '').trim();
-              print(content);
-              await Share.share(content);
-              changeLoadingShareConversationViaURL(false);
-            },
-          ),
-        ),
-        const SizedBox(height: 4),
-        Card(
-          shape: const RoundedRectangleBorder(borderRadius: BorderRadius.all(Radius.circular(8))),
-          child: Column(
-            children: [
-              ListTile(
-                title: const Text('Send Transcript'),
-                leading: loadingShareTranscript ? _getLoadingIndicator() : const Icon(Icons.description),
-                onTap: () async {
-                  if (loadingShareTranscript) return;
-                  changeLoadingShareTranscript(true);
-                  String content = '''
-              ${widget.conversation.structured.title}
-
-              ${widget.conversation.getTranscript(generate: true)}
-              '''
-                      .replaceAll('  ', '')
-                      .trim();
-                  // TODO: Deeplink that let people download the app.
-                  await Share.share(content);
-                  changeLoadingShareTranscript(false);
-                },
-              ),
-              widget.conversation.discarded
-                  ? const SizedBox()
-                  : ListTile(
-                      title: const Text('Send Summary'),
-                      leading: loadingShareSummary ? _getLoadingIndicator() : const Icon(Icons.summarize),
-                      onTap: () async {
-                        if (loadingShareSummary) return;
-                        changeLoadingShareSummary(true);
-                        String content = widget.conversation.structured.toString().replaceAll('  ', '').trim();
-                        await Share.share(content);
-                        changeLoadingShareSummary(false);
-                      },
-                    )
-            ],
-          ),
-        ),
-        const SizedBox(height: 4),
-        Card(
-          shape: const RoundedRectangleBorder(borderRadius: BorderRadius.all(Radius.circular(8))),
-          child: Column(
-            children: [
-              ListTile(
-                title: const Text('Copy Transcript'),
-                leading: const Icon(Icons.copy),
-                onTap: () => _copyContent(context, widget.conversation.getTranscript(generate: true)),
-              ),
-              widget.conversation.discarded
-                  ? const SizedBox()
-                  : ListTile(
-                      title: const Text('Copy Summary'),
-                      leading: const Icon(Icons.file_copy),
-                      onTap: () => _copyContent(
-                        context,
-                        widget.conversation.structured.toString(),
-                      ),
-                    )
-            ],
-          ),
-        ),
-      ],
+                  const SizedBox(height: 16),
+                ],
+        );
+      },
     );
   }
 }
 
-class GetSheetMainOptions extends StatelessWidget {
-  const GetSheetMainOptions({
-    super.key,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Consumer<ConversationDetailProvider>(builder: (context, provider, child) {
-      return Column(
-        children: [
-          Card(
-            shape: const RoundedRectangleBorder(borderRadius: BorderRadius.all(Radius.circular(8))),
-            child: Column(
-              children: [
-                ListTile(
-                  title: const Text('Share'),
-                  leading: const Icon(Icons.share),
-                  trailing: const Icon(Icons.arrow_forward_ios, size: 20),
-                  onTap: () {
-                    provider.toggleShareOptionsInSheet(!provider.displayShareOptionsInSheet);
-                  },
-                )
-              ],
+extension _AppResultDetailWidgetSliver on _AppResultDetailWidgetState {
+  Widget _buildSliver(BuildContext context, String content, ConversationSummarySelection selection) {
+    if (content.isEmpty || _isEditing) {
+      return SliverMainAxisGroup(
+        slivers: [
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: OmiSpacing.xs),
+              child: content.isEmpty ? _buildNoSummaryForApp(context) : _buildEditor(context),
             ),
           ),
-          const SizedBox(height: 4),
-          const SizedBox(height: 4),
-          Card(
-            shape: const RoundedRectangleBorder(
-              borderRadius: BorderRadius.all(Radius.circular(8)),
-            ),
-            child: Column(
-              children: [
-                //ListTile(
-                //  title: Text(provider.conversation.discarded ? 'Summarize' : 'Re-summarize'),
-                //  leading: provider.loadingReprocessConversation
-                //      ? const SizedBox(
-                //          width: 24,
-                //          height: 24,
-                //          child: CircularProgressIndicator(
-                //            valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                //          ),
-                //        )
-                //      : const Icon(Icons.refresh),
-                //  onTap: provider.loadingReprocessConversation
-                //      ? null
-                //      : () async {
-                //          final connectivityProvider = Provider.of<ConnectivityProvider>(context, listen: false);
-                //          if (connectivityProvider.isConnected) {
-                //            await provider.reprocessConversation();
-                //            if (context.mounted) {
-                //              Navigator.pop(context);
-                //            }
-                //          } else {
-                //            showDialog(
-                //              builder: (c) => getDialog(
-                //                context,
-                //                () => Navigator.pop(context),
-                //                () => Navigator.pop(context),
-                //                'Unable to Re-summarize Conversation',
-                //                'Please check your internet connection and try again.',
-                //                singleButton: true,
-                //                okButtonText: 'OK',
-                //              ),
-                //              context: context,
-                //            );
-                //          }
-                //        },
-                //),
-                ListTile(
-                  title: const Text('Delete'),
-                  leading: const Icon(
-                    Icons.delete,
-                  ),
-                  onTap: provider.loadingReprocessConversation
-                      ? null
-                      : () {
-                          final connectivityProvider = Provider.of<ConnectivityProvider>(context, listen: false);
-                          if (connectivityProvider.isConnected) {
-                            showDialog(
-                              context: context,
-                              builder: (c) => getDialog(
-                                context,
-                                () => Navigator.pop(context),
-                                () {
-                                  context
-                                      .read<ConversationProvider>()
-                                      .deleteConversation(provider.conversation, provider.conversationIdx);
-                                  Navigator.pop(context, true);
-                                  Navigator.pop(context, true);
-                                  Navigator.pop(context, {'deleted': true});
-                                },
-                                'Delete Conversation?',
-                                'Are you sure you want to delete this conversation? This action cannot be undone.',
-                                okButtonText: 'Confirm',
-                              ),
-                            );
-                          } else {
-                            showDialog(
-                              builder: (c) => getDialog(
-                                  context,
-                                  () => Navigator.pop(context),
-                                  () => Navigator.pop(context),
-                                  'Unable to Delete Conversation',
-                                  'Please check your internet connection and try again.',
-                                  singleButton: true,
-                                  okButtonText: 'OK'),
-                              context: context,
-                            );
-                          }
-                        },
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 4),
-          Card(
-            shape: const RoundedRectangleBorder(borderRadius: BorderRadius.all(Radius.circular(8))),
-            child: Column(
-              children: [
-                ListTile(
-                  onTap: () {
-                    provider.toggleDevToolsInSheet(!provider.displayDevToolsInSheet);
-                  },
-                  title: const Text('Developer Tools'),
-                  leading: const Icon(
-                    Icons.developer_mode,
-                    color: Colors.white,
-                  ),
-                  trailing: const Icon(Icons.arrow_forward_ios, size: 20),
-                )
-              ],
-            ),
-          )
+          const SliverToBoxAdapter(child: SizedBox(height: OmiSpacing.lg)),
         ],
       );
-    });
+    }
+
+    return SliverMainAxisGroup(
+      slivers: [
+        SliverPadding(
+          padding: const EdgeInsets.only(bottom: OmiSpacing.lg),
+          sliver: ConversationMarkdownSliver(
+            content: content,
+            searchQuery: widget.searchQuery,
+            currentResultIndex: widget.currentResultIndex,
+            onDoubleTap: widget.onSaveSummarySelection == null || !selection.canEdit(widget.conversation)
+                ? null
+                : () => _startEditing(content),
+          ),
+        ),
+        if (widget.app != null) SliverToBoxAdapter(child: _buildAppAttribution(context, widget.app!)),
+      ],
+    );
   }
-}
 
-class ShowOptionsBottomSheet extends StatelessWidget {
-  const ShowOptionsBottomSheet({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.surface,
-        borderRadius: const BorderRadius.only(topLeft: Radius.circular(16), topRight: Radius.circular(16)),
+  /// The app that wrote this summary, opening its page. Omi's own summary (and an app the catalog no
+  /// longer knows) has nowhere to go, so it shows no row; the bottom pill names the source either way.
+  Widget _buildAppAttribution(BuildContext context, App app) {
+    const avatarRadius = 12.0;
+    final avatar = CachedNetworkImage(
+      imageUrl: app.getImageUrl(),
+      imageBuilder: (context, imageProvider) =>
+          CircleAvatar(backgroundColor: OmiColors.textPrimary, radius: avatarRadius, backgroundImage: imageProvider),
+      errorWidget: (context, url, error) => CircleAvatar(
+        backgroundColor: OmiColors.textPrimary,
+        radius: avatarRadius,
+        child: const Icon(Icons.error_outline_rounded, size: 12),
       ),
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
-      child: Consumer<ConversationDetailProvider>(builder: (context, provider, child) {
-        return Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const GetSheetTitle(),
-            (provider.displayDevToolsInSheet
-                ? GetDevToolsOptions(
-                    conversation: provider.conversation,
-                  )
-                : provider.displayShareOptionsInSheet
-                    ? GetShareOptions(
-                        conversation: provider.conversation,
-                      )
-                    : const GetSheetMainOptions()),
-            const SizedBox(height: 40),
-          ],
-        );
-      }),
+      progressIndicatorBuilder: (context, url, progress) => CircleAvatar(
+        backgroundColor: OmiColors.surface2,
+        radius: avatarRadius,
+        child: const OmiSpinner(size: OmiSpinnerSize.small),
+      ),
+    );
+
+    return Semantics(
+      button: true,
+      child: GestureDetector(
+        onTap: () async {
+          PlatformManager.instance.analytics.pageOpened('App Detail');
+          await routeToPage(context, AppDetailPage(app: app));
+        },
+        child: Padding(
+          padding: const EdgeInsets.only(top: OmiSpacing.sm, left: OmiSpacing.xxs),
+          child: Row(
+            children: [
+              avatar,
+              const SizedBox(width: OmiSpacing.xs),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      app.name.decodeString,
+                      maxLines: 1,
+                      style: OmiType.footnote.copyWith(fontWeight: FontWeight.w500),
+                    ),
+                    Text(
+                      app.description.decodeString,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: OmiType.caption.copyWith(color: OmiColors.textTertiary),
+                    ),
+                  ],
+                ),
+              ),
+              SizedBox(width: 42, child: Icon(Icons.arrow_forward_ios, color: OmiColors.textPrimary, size: 20)),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }

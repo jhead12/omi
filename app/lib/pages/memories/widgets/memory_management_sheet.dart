@@ -1,53 +1,141 @@
 import 'package:flutter/material.dart';
+
+import 'package:provider/provider.dart';
+
+import 'package:omi/backend/schema/memory.dart';
 import 'package:omi/providers/memories_provider.dart';
-import 'package:omi/utils/ui_guidelines.dart';
+import 'package:omi/utils/l10n_extensions.dart';
+import 'package:omi/ui/ui.dart';
 
 class MemoryManagementSheet extends StatelessWidget {
   final MemoriesProvider provider;
 
-  const MemoryManagementSheet({
-    super.key,
-    required this.provider,
-  });
+  const MemoryManagementSheet({super.key, required this.provider});
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      decoration: BoxDecoration(
-        color: AppStyles.backgroundSecondary,
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      child: SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            _buildHeader(context),
-            const Divider(height: 1, color: Colors.white10),
-            _buildMemoryCount(context),
-            _buildActionButtons(context),
-          ],
-        ),
-      ),
+    return Consumer<MemoriesProvider>(
+      builder: (context, provider, child) {
+        return SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _buildFilterSection(context),
+              Divider(height: 1, color: OmiColors.border),
+              _buildMemoryCount(context),
+              _buildActionButtons(context),
+            ],
+          ),
+        );
+      },
     );
   }
 
-  Widget _buildHeader(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 16, 16, 16),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          const Text(
-            'Memory Management',
-            style: AppStyles.subtitle,
+  Widget _buildFilterSection(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 8, 16, 8),
+          child: OmiSectionHeader(context.l10n.filterMemories),
+        ),
+        _buildCategoryFilterOption(context, context.l10n.filterAll, null),
+        _buildCategoryFilterOption(context, context.l10n.filterSystem, MemoryCategory.system),
+        _buildCategoryFilterOption(context, context.l10n.filterInteresting, MemoryCategory.interesting),
+        _buildCategoryFilterOption(context, context.l10n.filterManual, MemoryCategory.manual),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+          child: Divider(height: 1, color: OmiColors.border),
+        ),
+        if (provider.memoryBeliefEnabled) ...[
+          _buildFilterOption(
+            context,
+            context.l10n.current,
+            isSelected: provider.collectionView == MemoryCollectionView.usefulNow,
+            onTap: () => provider.setCollectionView(MemoryCollectionView.usefulNow),
           ),
-          IconButton(
-            icon: const Icon(Icons.close, color: Colors.white70),
-            onPressed: () => Navigator.pop(context),
-            padding: EdgeInsets.zero,
-            constraints: const BoxConstraints(),
+          _buildFilterOption(
+            context,
+            context.l10n.memoryHistory,
+            isSelected: provider.collectionView == MemoryCollectionView.history,
+            onTap: () => provider.setCollectionView(MemoryCollectionView.history),
+          ),
+          _buildFilterOption(
+            context,
+            context.l10n.allMemories,
+            isSelected: provider.collectionView == MemoryCollectionView.all,
+            onTap: () => provider.setCollectionView(MemoryCollectionView.all),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+            child: Divider(height: 1, color: OmiColors.border),
           ),
         ],
+        _buildFilterOption(
+          context,
+          context.l10n.memoryThisDevice,
+          isSelected: provider.filterThisDeviceOnly,
+          onTap: () => provider.setFilterThisDeviceOnly(!provider.filterThisDeviceOnly),
+        ),
+        const SizedBox(height: 16),
+      ],
+    );
+  }
+
+  Widget _buildCategoryFilterOption(BuildContext context, String label, MemoryCategory? category) {
+    // If category is null, it represents "All"
+    // For "All", it is selected if the set is empty.
+    final bool isSelected;
+    if (category == null) {
+      isSelected = provider.selectedCategories.isEmpty;
+    } else {
+      isSelected = provider.selectedCategories.contains(category);
+    }
+
+    return _buildFilterOption(
+      context,
+      label,
+      isSelected: isSelected,
+      onTap: () {
+        if (category == null) {
+          provider.clearCategoryFilter();
+        } else {
+          provider.toggleCategoryFilter(category);
+        }
+        // Do NOT pop here to allow multiple selections
+      },
+    );
+  }
+
+  Widget _buildFilterOption(
+    BuildContext context,
+    String label, {
+    required bool isSelected,
+    required VoidCallback onTap,
+  }) {
+    return Semantics(
+      selected: isSelected,
+      button: true,
+      child: InkWell(
+        onTap: onTap,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(minHeight: kOmiMinTapTarget),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    label,
+                    style: OmiType.callout.copyWith(fontWeight: isSelected ? FontWeight.w600 : FontWeight.w400),
+                  ),
+                ),
+                if (isSelected) Icon(Icons.check, color: OmiColors.accent, size: 20),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -63,14 +151,11 @@ class MemoryManagementSheet extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            'You have $totalMemories total memories',
-            style: AppStyles.body,
-          ),
+          Text(context.l10n.totalMemoriesCount(totalMemories), style: OmiType.subhead.copyWith(height: 1.4)),
           const SizedBox(height: 8),
-          _buildMemoryCountRow(Icons.public, 'Public memories', publicMemories),
+          _buildMemoryCountRow(Icons.public, context.l10n.publicMemories, publicMemories),
           const SizedBox(height: 4),
-          _buildMemoryCountRow(Icons.lock_outline, 'Private memories', privateMemories),
+          _buildMemoryCountRow(Icons.lock_outline, context.l10n.privateMemories, privateMemories),
         ],
       ),
     );
@@ -79,19 +164,14 @@ class MemoryManagementSheet extends StatelessWidget {
   Widget _buildMemoryCountRow(IconData icon, String label, int count) {
     return Row(
       children: [
-        Icon(icon, size: 16, color: Colors.white60),
+        Icon(icon, size: 16, color: OmiColors.textSecondary),
         const SizedBox(width: 8),
-        Text(
-          label,
-          style: AppStyles.caption,
-        ),
+        Text(label, style: OmiType.footnote.copyWith(color: OmiColors.textPrimary.withValues(alpha: 0.7))),
         const Spacer(),
-        Text(
-          count.toString(),
-          style: AppStyles.caption.copyWith(
-            fontWeight: FontWeight.w600,
-          ),
-        ),
+        Text(count.toString(),
+            style: OmiType.footnote
+                .copyWith(color: OmiColors.textPrimary.withValues(alpha: 0.7))
+                .copyWith(fontWeight: FontWeight.w600)),
       ],
     );
   }
@@ -102,179 +182,83 @@ class MemoryManagementSheet extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          _buildActionButton(
-            context,
-            'Make All Memories Private',
-            Icons.lock_outline,
-            Colors.white.withOpacity(0.1),
-            () => _makeAllMemoriesPrivate(context),
+          OmiButton.secondary(
+            label: context.l10n.makeAllPrivate,
+            icon: Icons.lock_outline,
+            expand: true,
+            onPressed: () {
+              _makeAllMemoriesPrivate(context);
+            },
           ),
           const SizedBox(height: 12),
-          _buildActionButton(
-            context,
-            'Make All Memories Public',
-            Icons.public,
-            Colors.white.withOpacity(0.1),
-            () => _makeAllMemoriesPublic(context),
+          OmiButton.secondary(
+            label: context.l10n.makeAllPublic,
+            icon: Icons.public,
+            expand: true,
+            onPressed: () {
+              _makeAllMemoriesPublic(context);
+            },
           ),
           const SizedBox(height: 24),
-          const Divider(height: 1, color: Colors.white10),
+          Divider(height: 1, color: OmiColors.border),
           const SizedBox(height: 24),
-          _buildActionButton(
-            context,
-            'Delete All Memories',
-            Icons.delete_outline,
-            Colors.red.withOpacity(0.1),
-            () => _confirmDeleteAllMemories(context),
-            textColor: Colors.red,
-            iconColor: Colors.red,
-          ),
-          const SizedBox(height: 12),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildActionButton(
-    BuildContext context,
-    String text,
-    IconData icon,
-    Color backgroundColor,
-    VoidCallback onPressed, {
-    Color textColor = Colors.white,
-    Color iconColor = Colors.white,
-  }) {
-    return ElevatedButton(
-      onPressed: onPressed,
-      style: ElevatedButton.styleFrom(
-        backgroundColor: backgroundColor,
-        foregroundColor: textColor,
-        elevation: 0,
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(10),
-        ),
-      ),
-      child: Row(
-        children: [
-          Icon(icon, size: 20, color: iconColor),
-          const SizedBox(width: 12),
-          Text(
-            text,
-            style: TextStyle(
-              color: textColor,
-              fontSize: 15,
-              fontWeight: FontWeight.w500,
-            ),
+          OmiButton.destructive(
+            label: context.l10n.deleteAllMemories,
+            icon: Icons.delete_outline,
+            expand: true,
+            // Not awaited: the button would spin for as long as the confirmation is open.
+            onPressed: () {
+              _confirmDeleteAllMemories(context);
+            },
           ),
         ],
       ),
     );
   }
 
-  void _makeAllMemoriesPrivate(BuildContext context) async {
-    Navigator.pop(context);
-    await provider.updateAllMemoriesVisibility(true);
+  Future<void> _makeAllMemoriesPrivate(BuildContext context) => _setAllVisibility(context, private: true);
 
-    if (context.mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: const Text('All memories are now private'),
-          backgroundColor: AppStyles.backgroundTertiary,
-          behavior: SnackBarBehavior.floating,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(10),
-          ),
-          margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-          duration: const Duration(seconds: 2),
-        ),
-      );
+  Future<void> _makeAllMemoriesPublic(BuildContext context) => _setAllVisibility(context, private: false);
+
+  Future<void> _setAllVisibility(BuildContext context, {required bool private}) async {
+    // The sheet closes first; the result toast goes to the page underneath, so keep hold of a
+    // context that outlives the sheet.
+    final pageContext = Navigator.of(context).context;
+    Navigator.pop(context);
+    final updated = await provider.updateAllMemoriesVisibility(private);
+    if (!pageContext.mounted) return;
+    final l10n = pageContext.l10n;
+    if (updated) {
+      OmiFeedback.confirm(pageContext, private ? l10n.allMemoriesPrivateResult : l10n.allMemoriesPublicResult);
+    } else {
+      OmiFeedback.error(pageContext, l10n.somethingWentWrong);
     }
   }
 
-  void _makeAllMemoriesPublic(BuildContext context) async {
-    Navigator.pop(context);
-    await provider.updateAllMemoriesVisibility(false);
-
-    if (context.mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: const Text('All memories are now public'),
-          backgroundColor: AppStyles.backgroundTertiary,
-          behavior: SnackBarBehavior.floating,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(10),
-          ),
-          margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-          duration: const Duration(seconds: 2),
-        ),
-      );
-    }
-  }
-
-  void _confirmDeleteAllMemories(BuildContext context) {
+  Future<void> _confirmDeleteAllMemories(BuildContext context) async {
+    final pageContext = Navigator.of(context).context;
     if (provider.memories.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: const Text('No memories to delete'),
-          backgroundColor: AppStyles.backgroundTertiary,
-          duration: const Duration(seconds: 2),
-          behavior: SnackBarBehavior.floating,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(10),
-          ),
-          margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-        ),
-      );
       Navigator.pop(context);
+      OmiFeedback.info(pageContext, pageContext.l10n.noMemoriesToDelete);
       return;
     }
 
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: AppStyles.backgroundSecondary,
-        title: const Text(
-          'Clear Omi\'s Memory',
-          style: TextStyle(color: Colors.white),
-        ),
-        content: Text(
-          'Are you sure you want to clear Omi\'s memory? This action cannot be undone.',
-          style: TextStyle(color: Colors.grey.shade300),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: Text(
-              'Cancel',
-              style: TextStyle(color: Colors.grey.shade400),
-            ),
-          ),
-          TextButton(
-            onPressed: () {
-              provider.deleteAllMemories();
-              Navigator.pop(context); // Close dialog
-              Navigator.pop(context); // Close sheet
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  content: const Text('Omi\'s memory about you has been cleared'),
-                  backgroundColor: AppStyles.backgroundTertiary,
-                  duration: const Duration(seconds: 2),
-                  behavior: SnackBarBehavior.floating,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-                ),
-              );
-            },
-            child: const Text(
-              'Clear Memory',
-              style: TextStyle(color: Colors.red),
-            ),
-          ),
-        ],
-      ),
+    // Cannot be undone: confirm every time (docs/ux-contract.md §4).
+    final confirmed = await showOmiConfirm(
+      context,
+      title: context.l10n.clearMemoryTitle,
+      message: context.l10n.clearMemoryMessage,
+      confirmLabel: context.l10n.clearMemoryButton,
+      destructive: true,
     );
+    if (!confirmed || !context.mounted) return;
+    Navigator.pop(context); // Close sheet
+    final cleared = await provider.deleteAllMemories();
+    if (!pageContext.mounted) return;
+    if (cleared) {
+      OmiFeedback.confirm(pageContext, pageContext.l10n.memoryClearedSuccess);
+    } else {
+      OmiFeedback.error(pageContext, pageContext.l10n.somethingWentWrong);
+    }
   }
 }

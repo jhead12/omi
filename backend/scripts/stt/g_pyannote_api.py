@@ -9,7 +9,7 @@ headers = {"Authorization": f"Bearer {API_KEY}"}
 webhook = 'https://0c2f-136-24-214-241.ngrok-free.app/webhook'
 
 
-def file_to_base64_url(file_path):
+def file_to_base64_url(file_path: str) -> str:
     # Determine the MIME type of the file
     mime_type, _ = mimetypes.guess_type(file_path)
     if not mime_type:
@@ -50,14 +50,9 @@ def voice_identification():
         # "url": file_to_base64_url('pyannote_void.wav'),
         "url": file_to_base64_url('data/more/18-45-32-069108.wav'),
         "webhook": webhook,
-        "voiceprints": [
-            {
-                "voiceprint": "",
-                "label": "Joan"
-            }
-        ],
+        "voiceprints": [{"voiceprint": "", "label": "Joan"}],
     }
-    response = requests.request("POST", url, json=payload, headers=headers)
+    _response = requests.request("POST", url, json=payload, headers=headers)
 
 
 if __name__ == '__main__':

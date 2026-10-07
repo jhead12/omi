@@ -1,139 +1,220 @@
 import 'dart:async';
 
 import 'package:collection/collection.dart';
-import 'package:flutter/foundation.dart';
-import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+
+import 'package:omi/backend/preferences.dart';
 import 'package:omi/backend/schema/bt_device/bt_device.dart';
-import 'package:omi/services/devices/device_connection.dart';
-import 'package:omi/services/devices/errors.dart';
-import 'package:omi/services/devices/models.dart';
+import 'package:omi/services/devices/connectors/device_connection.dart';
+import 'package:omi/services/bridges/ble_bridge.dart';
+import 'package:omi/services/devices/discovery/apple_watch_discoverer.dart';
+import 'package:omi/services/devices/discovery/rayban_meta_discoverer.dart';
+import 'package:omi/services/devices/discovery/device_discoverer.dart';
+import 'package:omi/services/devices/discovery/native_bluetooth_discoverer.dart';
+import 'package:omi/utils/debug_log_manager.dart';
+import 'package:omi/utils/logger.dart';
+import 'package:omi/utils/mutex.dart';
 
-abstract class IDeviceService {
-  void start();
-  void stop();
-  Future<void> discover({String? desirableDeviceId, int timeout = 5});
+enum DeviceServiceStatus { init, ready, scanning, stop }
 
-  Future<DeviceConnection?> ensureConnection(String deviceId, {bool force = false});
+enum DeviceConnectionState { connected, connecting, disconnected }
 
-  void subscribe(IDeviceServiceSubsciption subscription, Object context);
-  void unsubscribe(Object context);
-
-  DateTime? getFirstConnectedAt();
-}
-
-enum DeviceServiceStatus {
-  init,
-  ready,
-  scanning,
-  stop,
-}
-
-enum DeviceConnectionState {
-  connected,
-  disconnected,
+/// Feature flags for Omi device capabilities
+/// Must match the firmware definitions in features.h
+class OmiFeatures {
+  static const int speaker = 1 << 0;
+  static const int accelerometer = 1 << 1;
+  static const int button = 1 << 2;
+  static const int battery = 1 << 3;
+  static const int usb = 1 << 4;
+  static const int haptic = 1 << 5;
+  static const int offlineStorage = 1 << 6;
+  static const int ledDimming = 1 << 7;
+  static const int micGain = 1 << 8;
 }
 
 abstract class IDeviceServiceSubsciption {
   void onDevices(List<BtDevice> devices);
   void onStatusChanged(DeviceServiceStatus status);
-  void onDeviceConnectionStateChanged(String deviceId, DeviceConnectionState state);
+  void onDeviceConnectionStateChanged(
+    String deviceId,
+    DeviceConnectionState state,
+  );
 }
 
-class DeviceService implements IDeviceService {
+typedef DeviceConnectionBuilder = DeviceConnection? Function(BtDevice device);
+
+class DeviceService {
+  DeviceService({DeviceConnectionBuilder? connectionBuilder})
+      : _connectionBuilder = connectionBuilder ?? DeviceConnectionFactory.create;
+
+  final DeviceConnectionBuilder _connectionBuilder;
+
   DeviceServiceStatus _status = DeviceServiceStatus.init;
   List<BtDevice> _devices = [];
-  List<ScanResult> _bleDevices = [];
+  Future<void>? _activeDiscovery;
+  Future<void>? _queuedDiscovery;
+
+  final List<DeviceDiscoverer> _discoverers = [
+    NativeBluetoothDiscoverer(),
+    AppleWatchDiscoverer(),
+    RayBanMetaDiscoverer(),
+  ];
 
   final Map<Object, IDeviceServiceSubsciption> _subscriptions = {};
 
-  DeviceConnection? _connection;
+  final Map<String, DeviceConnection> _connections = {};
 
+  DeviceConnection? connectionFor(String deviceId) => _connections[deviceId];
+  List<DeviceConnection> get connections => List.unmodifiable(_connections.values);
   List<BtDevice> get devices => _devices;
 
   DeviceServiceStatus get status => _status;
 
-  DateTime? _firstConnectedAt;
+  /// When iOS reports a stale bond (pairing_lost / CB error 14), automatic reconnect
+  /// loops are blocked until the user forgets the device in Settings and explicitly retries.
+  bool _staleBondRecoveryRequired = false;
+  bool get staleBondRecoveryRequired => _staleBondRecoveryRequired;
 
-  @override
-  Future<void> discover({
-    String? desirableDeviceId,
-    int timeout = 5,
-  }) async {
-    debugPrint("Device discovering...");
-    if (_status != DeviceServiceStatus.ready) {
-      logCommonErrorMessage("Device service is not ready, may busying or stop");
-      return;
-    }
-
-    if (!(await FlutterBluePlus.isSupported)) {
-      logCommonErrorMessage("Bluetooth is not supported");
-      return;
-    }
-
-    if (FlutterBluePlus.isScanningNow) {
-      debugPrint("Device service is scanning...");
-      return;
-    }
-
-    // Listen to scan results, always re-emits previous results
-    var discoverSubscription = FlutterBluePlus.scanResults.listen(
-      (results) async {
-        await _onBleDiscovered(results, desirableDeviceId);
-      },
-      onError: (e) {
-        debugPrint('bleFindDevices error: $e');
-      },
-    );
-    FlutterBluePlus.cancelWhenScanComplete(discoverSubscription);
-
-    // Only look for devices that implement Omi or Frame main service
-    _status = DeviceServiceStatus.scanning;
-    await FlutterBluePlus.adapterState.where((val) => val == BluetoothAdapterState.on).first;
-    await FlutterBluePlus.startScan(
-      timeout: Duration(seconds: timeout),
-      withServices: [Guid(omiServiceUuid), Guid(frameServiceUuid)],
-    );
-    _status = DeviceServiceStatus.ready;
+  void requireStaleBondRecovery() {
+    _staleBondRecoveryRequired = true;
   }
 
-  Future<void> _onBleDiscovered(List<ScanResult> results, String? desirableDeviceId) async {
-    _bleDevices = results.where((r) => r.device.platformName.isNotEmpty).toList();
-    _bleDevices.sort((a, b) => b.rssi.compareTo(a.rssi));
-    _devices = _bleDevices.map<BtDevice>((e) => BtDevice.fromScanResult(e)).toList();
-    onDevices(devices);
+  void clearStaleBondRecoveryRequirement() {
+    _staleBondRecoveryRequired = false;
+  }
 
-    // Check desirable device
-    if (desirableDeviceId != null && desirableDeviceId.isNotEmpty) {
-      await ensureConnection(desirableDeviceId, force: true);
+  DateTime? _firstConnectedAt;
+
+  /// Runs one follow-up scan when a caller retries while the current scan is
+  /// still winding down. In particular, this makes the Bluetooth-enable
+  /// recovery action reliable instead of silently returning while a blocked
+  /// scan still owns the service.
+  Future<void> discover({String? desirableDeviceId, int timeout = 5}) {
+    if (_queuedDiscovery != null) return _queuedDiscovery!;
+    if (_status == DeviceServiceStatus.scanning) {
+      final activeDiscovery = _activeDiscovery;
+      if (activeDiscovery == null) return Future.value();
+      return _queuedDiscovery ??= activeDiscovery.then<void>(
+        (_) => _runQueuedDiscovery(desirableDeviceId: desirableDeviceId, timeout: timeout),
+        onError: (_, __) => _runQueuedDiscovery(desirableDeviceId: desirableDeviceId, timeout: timeout),
+      );
+    }
+    if (_status != DeviceServiceStatus.ready) {
+      Logger.debug('Device service is not ready, may busying or stop');
+      return Future.value();
+    }
+    return _discover(desirableDeviceId: desirableDeviceId, timeout: timeout);
+  }
+
+  Future<void> _runQueuedDiscovery({String? desirableDeviceId, required int timeout}) async {
+    _queuedDiscovery = null;
+    await discover(desirableDeviceId: desirableDeviceId, timeout: timeout);
+  }
+
+  Future<void> _discover({String? desirableDeviceId, required int timeout}) async {
+    Logger.debug("Device discovering...");
+    final completion = Completer<void>();
+    _activeDiscovery = completion.future;
+    _status = DeviceServiceStatus.scanning;
+
+    try {
+      final discoveredDevices = <BtDevice>[];
+
+      final supportedDiscoverers = _discoverers.where((d) => d.isSupported).toList();
+      final discoveryFutures = supportedDiscoverers.map((d) async {
+        try {
+          final result = await d.discover(timeout: timeout);
+          return result.devices;
+        } catch (e, st) {
+          Logger.debug('Discovery failed for ${d.name}: $e');
+          Logger.debug('$st');
+          return <BtDevice>[];
+        }
+      });
+
+      // Wait for all discoveries to complete
+      final results = await Future.wait(discoveryFutures);
+
+      // Combine all discovered devices
+      for (final devices in results) {
+        discoveredDevices.addAll(devices);
+      }
+
+      _devices = discoveredDevices;
+      onDevices(devices);
+
+      if (desirableDeviceId != null && desirableDeviceId.isNotEmpty) {
+        await ensureConnection(desirableDeviceId, force: true);
+      }
+    } finally {
+      _status = DeviceServiceStatus.ready;
+      if (!completion.isCompleted) completion.complete();
+      _activeDiscovery = null;
     }
   }
 
   Future<void> _connectToDevice(String id) async {
-    // Drop exist connection first
-    if (_connection?.status == DeviceConnectionState.connected) {
-      await _connection?.disconnect();
-    }
-    _connection = null;
+    await _teardownConnection(id);
 
-    var bleDevice = _bleDevices.firstWhereOrNull((f) => f.device.remoteId.str == id);
     var device = _devices.firstWhereOrNull((f) => f.id == id);
-    if (bleDevice == null || device == null) {
-      debugPrint("bleDevice or device is null");
-      return;
+    Logger.debug(
+      '[DeviceService] device lookup result: ${device?.name ?? "NULL"} (locator: ${device?.locator?.kind})',
+    );
+
+    // If device not in discovered list, try to get it from SharedPreferences
+    // This allows background reconnection without scanning
+    if (device == null) {
+      Logger.debug(
+        '[DeviceService] Device not in discovered list, checking stored device',
+      );
+      device = _getStoredDevice(id);
+      if (device != null) {
+        Logger.debug('[DeviceService] Using stored device: ${device.name}');
+        if (!_devices.any((d) => d.id == device!.id)) {
+          _devices.add(device);
+        }
+      } else {
+        Logger.debug(
+          '[DeviceService] No stored device available for $id, returning',
+        );
+        return;
+      }
     }
 
-    // Check exist ble device connection, force disconnect
-    if (bleDevice.device.isConnected) {
-      await bleDevice.device.disconnect();
+    final connection = _connectionBuilder(device);
+    if (connection != null) {
+      _connections[id] = connection;
+      try {
+        await connection.connect(
+          onConnectionStateChanged: onDeviceConnectionStateChanged,
+        );
+      } catch (_) {
+        // A native GATT link may already be up even when device-specific
+        // initialization (for example, a protected Limitless write) fails.
+        // Tear that partial connection down so the UI cannot retain a ghost
+        // "connected" device and the next user attempt starts cleanly.
+        try {
+          await connection.disconnect();
+        } catch (e) {
+          Logger.debug('[DeviceService] Failed to disconnect partial connection: $e');
+        }
+        try {
+          await connection.transport.dispose();
+        } catch (e) {
+          Logger.debug('[DeviceService] Failed to dispose partial transport: $e');
+        }
+        if (identical(_connections[id], connection)) {
+          _connections.remove(id);
+        }
+        rethrow;
+      }
+    } else {
+      Logger.debug(
+        '[DeviceService] Failed to create device connection for ${device.id}',
+      );
     }
-
-    // Then create new connection
-    _connection = DeviceConnectionFactory.create(device, bleDevice.device);
-    await _connection?.connect(onConnectionStateChanged: onDeviceConnectionStateChanged);
-    return;
   }
 
-  @override
   void subscribe(IDeviceServiceSubsciption subscription, Object context) {
     _subscriptions.remove(context.hashCode);
     _subscriptions.putIfAbsent(context.hashCode, () => subscription);
@@ -143,29 +224,39 @@ class DeviceService implements IDeviceService {
     subscription.onStatusChanged(_status);
   }
 
-  @override
   void unsubscribe(Object context) {
     _subscriptions.remove(context.hashCode);
   }
 
-  @override
   void start() {
     _status = DeviceServiceStatus.ready;
 
     // TODO: Start watchdog to discover automatically, re-connect automatically
   }
 
-  @override
-  void stop() {
+  Future<void> stop() async {
     _status = DeviceServiceStatus.stop;
     onStatusChanged(_status);
 
-    if (FlutterBluePlus.isScanningNow) {
-      FlutterBluePlus.stopScan();
+    // Stop all discoverers to prevent resource leaks and battery drain
+    await stopDiscoverers();
+
+    for (final deviceId in _connections.keys.toList()) {
+      await _teardownConnection(deviceId);
     }
+
     _subscriptions.clear();
     _devices.clear();
-    _bleDevices.clear();
+  }
+
+  Future<void> stopDiscoverers() async {
+    for (final discoverer in _discoverers) {
+      try {
+        await discoverer.stop();
+      } catch (e) {
+        Logger.debug('DeviceService.stopDiscoverers: $e');
+      }
+    }
   }
 
   void onStatusChanged(DeviceServiceStatus status) {
@@ -174,8 +265,15 @@ class DeviceService implements IDeviceService {
     }
   }
 
-  void onDeviceConnectionStateChanged(String deviceId, DeviceConnectionState state) {
-    debugPrint("device connection state changed...${deviceId}...${state}");
+  void onDeviceConnectionStateChanged(
+    String deviceId,
+    DeviceConnectionState state,
+  ) {
+    Logger.debug("device connection state changed...$deviceId...$state");
+    DebugLogManager.logEvent('device_connection_state', {
+      'device_id': deviceId,
+      'state': state.name,
+    });
     for (var s in _subscriptions.values) {
       s.onDeviceConnectionStateChanged(deviceId, state);
     }
@@ -187,69 +285,111 @@ class DeviceService implements IDeviceService {
     }
   }
 
-  // Warn: Should use a better solution to prevent race conditions
-  bool mutex = false;
-  @override
-  Future<DeviceConnection?> ensureConnection(String deviceId, {bool force = false}) async {
-    while (mutex) {
-      await Future.delayed(const Duration(milliseconds: 50));
-    }
-    mutex = true;
+  final Mutex _mutex = Mutex();
 
-    debugPrint("ensureConnection ${_connection?.device.id} ${_connection?.status} ${force}");
+  Future<DeviceConnection?> ensureConnection(
+    String deviceId, {
+    bool force = false,
+  }) async {
+    await _mutex.acquire();
     try {
-      // Not force
-      if (!force && _connection != null) {
-        if (_connection?.device.id != deviceId || _connection?.status != DeviceConnectionState.connected) {
-          return null;
-        }
+      final existing = _connections[deviceId];
+      Logger.debug(
+        "ensureConnection $deviceId ${existing?.status} $force",
+      );
 
-        // connected
-        var pongAt = _connection?.pongAt;
-        var shouldPing = (pongAt == null || pongAt.isBefore(DateTime.now().subtract(const Duration(seconds: 5))));
-        if (shouldPing) {
-          var ok = await _connection?.ping() ?? false;
-          if (!ok) {
-            await _connection?.disconnect();
-            return null;
-          }
-        }
-
-        return _connection;
+      if (_staleBondRecoveryRequired) {
+        Logger.debug('ensureConnection blocked: stale iOS BLE bond recovery required');
+        return null;
       }
 
-      // Force
-      if (deviceId == _connection?.device.id && _connection?.status == DeviceConnectionState.connected) {
-        var pongAt = _connection?.pongAt;
-        var shouldPing = (pongAt == null || pongAt.isBefore(DateTime.now().subtract(const Duration(seconds: 5))));
-        if (shouldPing) {
-          var ok = await _connection?.ping() ?? false;
-          if (!ok) {
-            await _connection?.disconnect();
-            return null;
-          }
-        }
-
-        return _connection;
+      // Connected to this device — return it
+      if (existing?.status == DeviceConnectionState.connected && await existing!.transport.isConnected()) {
+        return existing;
       }
 
-      // connect
+      // Transport exists for this device but disconnected — native handles reconnection.
+      // Don't dispose and recreate the transport; that would cancel native's auto-reconnect.
+      // But if force=true (user-initiated), reconnect explicitly.
+      if (!force && existing != null) {
+        return null;
+      }
+
+      // No connection for this device — only connect on force (user-initiated)
+      if (!force) return null;
+
       try {
-        await _connectToDevice(deviceId);
+        if (existing != null && BleBridge.instance.preservesCaptureIntent(deviceId)) {
+          // Preserve the source and its listeners; native manageDevice will
+          // establish/discover a real link if the cached transport is down.
+          // Go through the connection (not the bare transport) so device setup
+          // such as the pendant time sync runs after the link returns, and a
+          // transport failure surfaces as DeviceConnectionException like the
+          // cold-connect path. Re-pass the service callback so later state
+          // changes keep reaching subscribers.
+          await existing.connect(onConnectionStateChanged: onDeviceConnectionStateChanged);
+        } else {
+          await _connectToDevice(deviceId);
+        }
       } on DeviceConnectionException catch (e) {
-        debugPrint(e.toString());
+        Logger.debug(e.cause);
         return null;
       }
 
       _firstConnectedAt ??= DateTime.now();
-      return _connection;
+      return _connections[deviceId];
     } finally {
-      mutex = false;
+      _mutex.release();
     }
   }
 
-  @override
   DateTime? getFirstConnectedAt() {
     return _firstConnectedAt;
+  }
+
+  // Helper method to get stored device from SharedPreferences
+  BtDevice? _getStoredDevice(String id) {
+    try {
+      return SharedPreferencesUtil().btDevices.firstWhereOrNull(
+            (d) => d.id == id && d.id.isNotEmpty,
+          );
+    } catch (e) {
+      Logger.debug('Error getting stored device: $e');
+    }
+    return null;
+  }
+
+  Future<void> disconnectDevice(String deviceId) async {
+    final connection = _connections[deviceId];
+    if (connection != null) {
+      Logger.debug("DeviceService: Disconnecting device $deviceId...");
+      await connection.disconnect();
+      _connections.remove(deviceId);
+    }
+  }
+
+  Future<void> _teardownConnection(String deviceId) async {
+    final connection = _connections.remove(deviceId);
+    if (connection == null) return;
+    if (connection.status == DeviceConnectionState.connected) {
+      try {
+        await connection.disconnect();
+      } catch (e) {
+        Logger.debug("DeviceService: disconnect for $deviceId failed: $e");
+      }
+    }
+    try {
+      await connection.transport.dispose();
+    } catch (e) {
+      Logger.debug("DeviceService: transport dispose for $deviceId failed: $e");
+    }
+  }
+
+  Future<void> forgetDevice(String deviceId) async {
+    Logger.debug("DeviceService: Forgetting device $deviceId");
+    clearStaleBondRecoveryRequirement();
+    await _teardownConnection(deviceId);
+
+    _devices.removeWhere((d) => d.id == deviceId);
   }
 }

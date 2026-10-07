@@ -1,19 +1,65 @@
-from typing import List
+from typing import Any, Protocol, cast
 
-from models.conversation import ConversationPhoto, Structured
-from utils.llm.clients import llm_mini
+from utils.llm.clients import get_llm
+from utils.llm.usage_tracker import track_usage, Features
+
+MessagePart = dict[str, object]
+ChatMessage = dict[str, object]
 
 
-def summarize_open_glass(photos: List[ConversationPhoto]) -> Structured:
-    photos_str = ''
-    for i, photo in enumerate(photos):
-        photos_str += f'{i + 1}. "{photo.description}"\n'
-    prompt = f'''The user took a series of pictures from his POV, generated a description for each photo, and wants to create a memory from them.
+class AsyncVisionLlm(Protocol):
+    async def ainvoke(
+        self,
+        input: object,
+        *,
+        config: dict[str, Any] | None = None,
+        max_completion_tokens: int | None = None,
+    ) -> object: ...
 
-      For the title, use the main topic of the scenes.
-      For the overview, condense the descriptions into a brief summary with the main topics discussed, make sure to capture the key points and important details.
-      For the category, classify the scenes into one of the available categories.
 
-      Photos Descriptions: ```{photos_str}```
-      '''.replace('    ', '').strip()
-    return llm_mini.with_structured_output(Structured).invoke(prompt)
+def _response_text(response: object) -> str:
+    content = getattr(response, "content", response)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in cast(list[object], content):
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                block = cast(dict[str, object], item)
+                text = block.get("text") or block.get("content") or ""
+                if text:
+                    parts.append(str(text))
+            elif item is not None:
+                parts.append(str(item))
+        return "".join(parts)
+    return "" if content is None else str(content)
+
+
+async def describe_image(uid: str, base64_data: str, content_type: str = "image/jpeg") -> str:
+    """
+    Generates a description for a base64 encoded image using a vision model via LangChain.
+    """
+    prompt = (
+        "You are my AI assistant, seeing the world through my smart glasses. In a single, descriptive paragraph, "
+        "tell me what's happening from a first-person perspective. Focus on the most important aspects of the scene: "
+        "the people, their actions, the key objects, and the overall environment. What is the general mood or atmosphere?"
+    )
+
+    content: list[MessagePart] = [
+        {"type": "text", "text": prompt},
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:{content_type};base64,{base64_data}"},
+        },
+    ]
+    message: ChatMessage = {
+        "role": "user",
+        "content": content,
+    }
+
+    with track_usage(uid, Features.OPENGLASS):
+        response = await cast(AsyncVisionLlm, get_llm('openglass')).ainvoke([message], max_completion_tokens=150)
+    description = _response_text(response).strip()
+    return description if description != '""' else ""

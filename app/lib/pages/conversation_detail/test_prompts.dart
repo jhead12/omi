@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
-import 'package:omi/backend/schema/conversation.dart';
 
-import '../../backend/http/api/conversations.dart';
+import 'package:omi/backend/schema/conversation.dart';
+import 'package:omi/utils/l10n_extensions.dart';
+import 'package:omi/backend/http/api/conversations.dart';
+import 'package:omi/ui/ui.dart';
 
 class TestPromptsPage extends StatefulWidget {
   final ServerConversation conversation;
@@ -17,12 +19,18 @@ class _TestPromptsPageState extends State<TestPromptsPage> {
   String result = '';
 
   @override
+  void dispose() {
+    controller.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Theme.of(context).colorScheme.primary,
+      backgroundColor: OmiColors.surface0,
       appBar: AppBar(
-        title: const Text('Test Conversation Prompt'),
-        backgroundColor: Theme.of(context).colorScheme.primary,
+        title: Text(context.l10n.testConversationPrompt),
+        backgroundColor: OmiColors.surface0,
         actions: [
           IconButton(
             onPressed: onTap,
@@ -30,10 +38,7 @@ class _TestPromptsPageState extends State<TestPromptsPage> {
                 ? const SizedBox(
                     width: 16,
                     height: 16,
-                    child: CircularProgressIndicator(
-                      color: Colors.white,
-                      strokeWidth: 2.0,
-                    ),
+                    child: OmiSpinner(),
                   )
                 : const Icon(Icons.send),
           ),
@@ -45,11 +50,11 @@ class _TestPromptsPageState extends State<TestPromptsPage> {
             padding: const EdgeInsets.all(16),
             child: TextField(
               controller: controller,
-              decoration: const InputDecoration(
-                labelText: 'Prompt',
-                labelStyle: TextStyle(color: Colors.white),
-                border: OutlineInputBorder(borderSide: BorderSide.none),
-                contentPadding: EdgeInsets.all(0),
+              decoration: InputDecoration(
+                labelText: context.l10n.prompt,
+                labelStyle: const TextStyle(color: Colors.white),
+                border: const OutlineInputBorder(borderSide: BorderSide.none),
+                contentPadding: const EdgeInsets.all(0),
               ),
               keyboardType: TextInputType.multiline,
               maxLines: 10,
@@ -57,24 +62,16 @@ class _TestPromptsPageState extends State<TestPromptsPage> {
               autofocus: true,
             ),
           ),
-          const SizedBox(
-            height: 16,
-          ),
-          result == ''
-              ? const SizedBox.shrink()
-              : const Padding(
-                  padding: EdgeInsets.all(16),
-                  child: Text(
-                    'Result',
-                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
-                  ),
-                ),
+          const SizedBox(height: 16),
           result == ''
               ? const SizedBox.shrink()
               : Padding(
                   padding: const EdgeInsets.all(16),
-                  child: Text(result.replaceAll('**', '')),
+                  child: Text(context.l10n.result, style: OmiType.callout.copyWith(fontWeight: FontWeight.w500)),
                 ),
+          result == ''
+              ? const SizedBox.shrink()
+              : Padding(padding: const EdgeInsets.all(16), child: Text(result.replaceAll('**', ''))),
           const SizedBox(height: 32),
         ],
       ),
@@ -89,10 +86,7 @@ class _TestPromptsPageState extends State<TestPromptsPage> {
       loading = true;
     });
 
-    var response = await testConversationPrompt(
-      controller.text,
-      widget.conversation.id,
-    );
+    var response = await testConversationPrompt(controller.text, widget.conversation.id);
     print('response: $response');
     result = response.toString();
     setState(() {

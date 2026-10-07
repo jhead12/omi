@@ -9,28 +9,12 @@ final class ProdEnv implements EnvFields {
   ProdEnv();
 
   @override
-  @EnviedField(varName: 'OPENAI_API_KEY', obfuscate: true)
-  final String? openAIAPIKey = _ProdEnv.openAIAPIKey;
-
-  @override
-  @EnviedField(varName: 'INSTABUG_API_KEY', obfuscate: true)
-  final String? instabugApiKey = _ProdEnv.instabugApiKey;
-
-  @override
-  @EnviedField(varName: 'MIXPANEL_PROJECT_TOKEN', obfuscate: true)
-  final String? mixpanelProjectToken = _ProdEnv.mixpanelProjectToken;
+  @EnviedField(varName: 'POSTHOG_API_KEY', obfuscate: true)
+  final String? posthogApiKey = _ProdEnv.posthogApiKey;
 
   @override
   @EnviedField(varName: 'API_BASE_URL', obfuscate: true)
   final String? apiBaseUrl = _ProdEnv.apiBaseUrl;
-
-  @override
-  @EnviedField(varName: 'GROWTHBOOK_API_KEY', obfuscate: true)
-  final String? growthbookApiKey = _ProdEnv.growthbookApiKey;
-
-  @override
-  @EnviedField(varName: 'GOOGLE_MAPS_API_KEY', obfuscate: true)
-  final String? googleMapsApiKey = _ProdEnv.googleMapsApiKey;
 
   @override
   @EnviedField(varName: 'INTERCOM_APP_ID', obfuscate: true)
@@ -45,6 +29,18 @@ final class ProdEnv implements EnvFields {
   final String? intercomAndroidApiKey = _ProdEnv.intercomAndroidApiKey;
 
   @override
-  @EnviedField(varName: 'POSTHOG_API_KEY', obfuscate: true)
-  final String? posthogApiKey = _ProdEnv.posthogApiKey;
+  @EnviedField(varName: 'GOOGLE_CLIENT_ID', obfuscate: true)
+  final String? googleClientId = _ProdEnv.googleClientId;
+
+  @override
+  @EnviedField(varName: 'GOOGLE_CLIENT_SECRET', obfuscate: true)
+  final String? googleClientSecret = _ProdEnv.googleClientSecret;
+
+  @override
+  @EnviedField(varName: 'USE_WEB_AUTH', obfuscate: false, defaultValue: false)
+  final bool? useWebAuth = _ProdEnv.useWebAuth;
+
+  @override
+  @EnviedField(varName: 'USE_AUTH_CUSTOM_TOKEN', obfuscate: false, defaultValue: false)
+  final bool? useAuthCustomToken = _ProdEnv.useAuthCustomToken;
 }

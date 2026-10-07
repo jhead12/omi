@@ -1,79 +1,242 @@
+import 'dart:async';
+import 'package:omi/services/proactivity/proactivity_runtime.dart';
+import 'dart:io';
+
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:flutter/material.dart';
-import 'package:omi/backend/auth.dart';
-import 'package:omi/backend/preferences.dart';
-import 'package:omi/providers/base_provider.dart';
-import 'package:omi/services/notifications.dart';
-import 'package:omi/utils/alerts/app_snackbar.dart';
-import 'package:omi/utils/analytics/mixpanel.dart';
-import 'package:instabug_flutter/instabug_flutter.dart';
+import 'package:flutter_timezone/flutter_timezone.dart';
 import 'package:url_launcher/url_launcher.dart';
-import 'package:google_sign_in/google_sign_in.dart';
+
 import 'package:omi/backend/http/api/apps.dart' as apps_api;
+import 'package:omi/backend/http/api/notifications.dart';
+import 'package:omi/backend/preferences.dart';
+import 'package:omi/env/env.dart';
+import 'package:omi/env/environment_profile.dart';
+import 'package:omi/app_globals.dart';
+import 'package:omi/providers/base_provider.dart';
+import 'package:omi/services/account_cutover/account_cutover_runtime.dart';
+import 'package:omi/services/auth_service.dart';
+import 'package:omi/services/siri_integration.dart';
+import 'package:omi/services/auth/auth_token_result.dart';
+import 'package:omi/services/notifications.dart';
+import 'package:omi/utils/auth/clear_user_state.dart';
+import 'package:omi/utils/alerts/app_snackbar.dart';
+import 'package:omi/utils/l10n_extensions.dart';
+import 'package:omi/utils/logger.dart';
+import 'package:omi/utils/platform/platform_manager.dart';
+import 'package:omi/utils/platform/platform_service.dart';
+
+/// Runs a provider-link helper, then migrates only the anonymous source proof
+/// it returned after the destination account has been established.
+Future<ProviderLinkResult?> completeProviderLinkAndMigrate({
+  required Future<ProviderLinkResult?> Function() linkProvider,
+  required Future<bool> Function(String sourceUid, String sourceToken) migrate,
+}) async {
+  final result = await linkProvider();
+  final source = result?.anonymousSourceMigration;
+  final destinationUid = result?.destinationUid;
+  if (source != null && destinationUid != null && destinationUid != source.uid) {
+    await migrate(source.uid, source.token);
+  }
+  return result;
+}
 
 class AuthenticationProvider extends BaseProvider {
-  final FirebaseAuth _auth = FirebaseAuth.instance;
+  FirebaseAuth get _auth => FirebaseAuth.instance;
+
   User? user;
   String? authToken;
   bool _loading = false;
+  bool _requiresReauthentication = false;
+  AuthSessionExpirationReason? _sessionExpirationReason;
+  int _sessionExpirationGeneration = 0;
+  StreamSubscription<User?>? _authStateSubscription;
+  StreamSubscription<User?>? _idTokenSubscription;
+  StreamSubscription<User?>? _siriIdTokenSubscription;
+  StreamSubscription<AuthSessionExpiredEvent>? _sessionExpiredSubscription;
+  @override
   bool get loading => _loading;
+  bool get requiresReauthentication => _requiresReauthentication;
 
-  AuthenticationProvider() {
-    _auth.authStateChanges().distinct((p, n) => p?.uid == n?.uid).listen((User? user) {
-      this.user = user;
-      SharedPreferencesUtil().uid = user?.uid ?? '';
-      SharedPreferencesUtil().email = user?.email ?? '';
-      SharedPreferencesUtil().givenName = user?.displayName?.split(' ')[0] ?? '';
-    });
-    _auth.idTokenChanges().distinct((p, n) => p?.uid == n?.uid).listen((User? user) async {
-      if (user == null) {
-        debugPrint('User is currently signed out or the token has been revoked! ${user == null}');
-        SharedPreferencesUtil().authToken = '';
-        authToken = null;
-      } else {
-        debugPrint('User is signed in at ${DateTime.now()} with user ${user.uid}');
-        try {
-          if (SharedPreferencesUtil().authToken.isEmpty ||
-              DateTime.now().millisecondsSinceEpoch > SharedPreferencesUtil().tokenExpirationTime) {
-            authToken = await getIdToken();
-          }
-        } catch (e) {
-          authToken = null;
-          debugPrint('Failed to get token: $e');
+  /// Why the current session expired, while [requiresReauthentication] is true.
+  AuthSessionExpirationReason? get sessionExpirationReason => _sessionExpirationReason;
+  int get sessionExpirationGeneration => _sessionExpirationGeneration;
+
+  AuthenticationProvider({bool initializeListeners = true}) {
+    if (initializeListeners) _initializeAuthListeners();
+  }
+
+  void _initializeAuthListeners() {
+    // DEBUG: Log initial state
+    Logger.debug(
+      'DEBUG AuthProvider: Initial currentUser=${_auth.currentUser?.uid}, isAnonymous=${_auth.currentUser?.isAnonymous}',
+    );
+
+    Future.microtask(() {
+      _authStateSubscription = _auth.authStateChanges().distinct((p, n) => p?.uid == n?.uid).listen((User? user) async {
+        PlatformManager.instance.analytics.bindIdentity(user?.uid);
+        unawaited(ProactivityRuntime.outbox.bindOwner(user != null && !user.isAnonymous ? user.uid : null));
+        AuthService.instance.handleAuthUserChanged(user?.uid);
+        Logger.debug(
+          'DEBUG AuthProvider: authStateChanges fired - user=${user?.uid}, isAnonymous=${user?.isAnonymous}',
+        );
+        this.user = user;
+        // Only update SharedPreferences if Firebase has a user
+        // Don't clear cached credentials - allows fallback for dev builds
+        if (user != null) {
+          SharedPreferencesUtil().uid = user.uid;
+          SharedPreferencesUtil().email = user.email ?? '';
+          SharedPreferencesUtil().givenName = user.displayName?.split(' ')[0] ?? '';
         }
-      }
-      notifyListeners();
+        final cutoverOwner = (user != null && !user.isAnonymous) ? user.uid : null;
+        unawaited(AccountCutoverRuntime.instance.bindAuthenticatedOwner(cutoverOwner));
+        notifyListeners();
+        await SiriIntegration.instance.accountChanged(user);
+      });
+      // Token refreshes are Siri-only. Keep the app's original UID-distinct
+      // listener so a token refresh does not replay its auth/UI side effects.
+      _siriIdTokenSubscription = _auth.idTokenChanges().listen((User? user) async {
+        if (user != null) await SiriIntegration.instance.refreshSession(user);
+      });
+      _idTokenSubscription = _auth.idTokenChanges().distinct((p, n) => p?.uid == n?.uid).listen((User? user) async {
+        PlatformManager.instance.analytics.bindIdentity(user?.uid);
+        unawaited(ProactivityRuntime.outbox.bindOwner(user != null && !user.isAnonymous ? user.uid : null));
+        AuthService.instance.handleAuthUserChanged(user?.uid);
+        if (user == null) {
+          Logger.debug('User is currently signed out or the token has been revoked!');
+          SharedPreferencesUtil().authToken = '';
+          SharedPreferencesUtil().tokenExpirationTime = 0;
+          authToken = null;
+        } else {
+          Logger.debug('User is signed in at ${DateTime.now()} with user ${user.uid}');
+          try {
+            if (_requiresReauthentication ||
+                SharedPreferencesUtil().authToken.isEmpty ||
+                DateTime.now().millisecondsSinceEpoch > SharedPreferencesUtil().tokenExpirationTime) {
+              authToken = await AuthService.instance.getIdToken();
+            }
+            if (authToken != null && authToken!.isNotEmpty) {
+              _requiresReauthentication = false;
+            }
+          } catch (e) {
+            authToken = null;
+            Logger.debug('Failed to get token: $e');
+          }
+        }
+        notifyListeners();
+      });
+      _sessionExpiredSubscription = AuthService.instance.sessionExpiredEvents.listen((event) async {
+        _requiresReauthentication = true;
+        _sessionExpirationReason = event.reason;
+        _sessionExpirationGeneration++;
+        user = null;
+        authToken = null;
+        final rootContext = globalNavigatorKey.currentContext;
+        if (rootContext != null && rootContext.mounted) {
+          clearAllUserState(rootContext);
+        }
+        notifyListeners();
+        await SiriIntegration.instance.accountChanged(null);
+      });
     });
   }
 
-  bool isSignedIn() => _auth.currentUser != null && !_auth.currentUser!.isAnonymous;
+  bool isSignedIn() {
+    return !_requiresReauthentication && _auth.currentUser != null && !_auth.currentUser!.isAnonymous;
+  }
+
+  bool get _hasFirebaseUser => _auth.currentUser != null && !_auth.currentUser!.isAnonymous;
+
+  @override
+  void dispose() {
+    _authStateSubscription?.cancel();
+    _idTokenSubscription?.cancel();
+    _siriIdTokenSubscription?.cancel();
+    _sessionExpiredSubscription?.cancel();
+    super.dispose();
+  }
 
   void setLoading(bool value) {
     _loading = value;
     notifyListeners();
   }
 
+  /// True only for a local_dev build. Drives whether the dev sign-in affordance
+  /// is offered at all; the authoritative gate is server-side.
+  bool get isLocalDevProfile => Env.profile == AppEnvironmentProfile.localDev;
+
+  Future<void> onLocalDevSignIn(Function() onSignIn) async {
+    if (loading) return;
+    setLoadingState(true);
+    try {
+      final credential = await AuthService.instance.signInWithLocalDevToken();
+      if (credential != null && _hasFirebaseUser) {
+        await _signIn(onSignIn, credential: credential, authProvider: 'local_dev');
+      } else {
+        AppSnackbar.showSnackbarError('Local development sign-in did not produce a session.');
+      }
+    } catch (e) {
+      // Surfaced verbatim: this path exists for developers, and the message
+      // already says exactly what is wrong (harness down, wrong profile, no
+      // emulator). Replacing it with a generic string would hide the diagnosis.
+      Logger.debug('Local development sign in error: $e');
+      AppSnackbar.showSnackbarError('$e');
+    }
+    setLoadingState(false);
+  }
+
   Future<void> onGoogleSignIn(Function() onSignIn) async {
+    final useWebAuth = Env.useWebAuth;
     if (!loading) {
       setLoadingState(true);
-      await signInWithGoogle();
-      if (isSignedIn()) {
-        _signIn(onSignIn);
-      } else {
-        AppSnackbar.showSnackbarError('Failed to sign in with Google, please try again.');
+      try {
+        UserCredential? credential;
+        if (PlatformService.isMobile && !useWebAuth) {
+          credential = await AuthService.instance.signInWithGoogleMobile();
+        } else {
+          credential = await AuthService.instance.authenticateWithProvider('google');
+        }
+        if (credential != null && _hasFirebaseUser) {
+          await _signIn(onSignIn, credential: credential, authProvider: 'google');
+        } else {
+          AppSnackbar.showSnackbarError(
+            globalNavigatorKey.currentContext?.l10n.authFailedToSignInWithGoogle ??
+                'Failed to sign in with Google, please try again.',
+          );
+        }
+      } catch (e) {
+        Logger.debug('OAuth Google sign in error: $e');
+        AppSnackbar.showSnackbarError(
+          globalNavigatorKey.currentContext?.l10n.authenticationFailed ?? 'Authentication failed. Please try again.',
+        );
       }
       setLoadingState(false);
     }
   }
 
   Future<void> onAppleSignIn(Function() onSignIn) async {
+    final useWebAuth = Env.useWebAuth;
     if (!loading) {
       setLoadingState(true);
-      await signInWithApple();
-      if (isSignedIn()) {
-        _signIn(onSignIn);
-      } else {
-        AppSnackbar.showSnackbarError('Failed to sign in with Apple, please try again.');
+      try {
+        UserCredential? credential;
+        if (PlatformService.isMobile && !useWebAuth && !Platform.isAndroid) {
+          credential = await AuthService.instance.signInWithAppleMobile();
+        } else {
+          credential = await AuthService.instance.authenticateWithProvider('apple');
+        }
+        if (credential != null && _hasFirebaseUser) {
+          await _signIn(onSignIn, credential: credential, authProvider: 'apple');
+        } else {
+          AppSnackbar.showSnackbarError(
+            globalNavigatorKey.currentContext?.l10n.authFailedToSignInWithApple ??
+                'Failed to sign in with Apple, please try again.',
+          );
+        }
+      } catch (e) {
+        Logger.debug('OAuth Apple sign in error: $e');
+        AppSnackbar.showSnackbarError(
+          globalNavigatorKey.currentContext?.l10n.authenticationFailed ?? 'Authentication failed. Please try again.',
+        );
       }
       setLoadingState(false);
     }
@@ -81,44 +244,67 @@ class AuthenticationProvider extends BaseProvider {
 
   Future<String?> _getIdToken() async {
     try {
-      final token = await getIdToken();
+      final token = await AuthService.instance.getIdToken();
       NotificationService.instance.saveNotificationToken();
+      try {
+        final timeZone = (await FlutterTimezone.getLocalTimezone()).identifier;
+        unawaited(syncUserTimeZoneServer(timeZone: timeZone));
+      } catch (e) {
+        Logger.debug('Failed to sync device timezone: $e');
+      }
 
-      debugPrint('Token: $token');
+      Logger.debug('Firebase token retrieved successfully');
       return token;
     } catch (e, stackTrace) {
-      AppSnackbar.showSnackbarError('Failed to retrieve firebase token, please try again.');
-
-      CrashReporting.reportHandledCrash(e, stackTrace, level: NonFatalExceptionLevel.error);
+      AppSnackbar.showSnackbarError(
+        globalNavigatorKey.currentContext?.l10n.authFailedToRetrieveToken ??
+            'Failed to retrieve firebase token, please try again.',
+      );
+      PlatformManager.instance.crashReporter.reportCrash(e, stackTrace);
 
       return null;
     }
   }
 
-  void _signIn(Function() onSignIn) async {
-    String? token = await _getIdToken();
+  Future<void> _signIn(Function() onSignIn, {required UserCredential credential, required String authProvider}) async {
+    final token = await _getIdToken();
 
     if (token != null) {
-      User user;
+      User currentUser;
       try {
-        user = FirebaseAuth.instance.currentUser!;
+        currentUser = FirebaseAuth.instance.currentUser!;
       } catch (e, stackTrace) {
-        AppSnackbar.showSnackbarError('Unexpected error signing in, Firebase error, please try again.');
+        AppSnackbar.showSnackbarError(
+          globalNavigatorKey.currentContext?.l10n.authUnexpectedErrorFirebase ??
+              'Unexpected error signing in, Firebase error, please try again.',
+        );
 
-        CrashReporting.reportHandledCrash(e, stackTrace, level: NonFatalExceptionLevel.error);
+        PlatformManager.instance.crashReporter.reportCrash(e, stackTrace);
         return;
       }
-      String newUid = user.uid;
+      final newUid = currentUser.uid;
       SharedPreferencesUtil().uid = newUid;
-      MixpanelManager().identify();
+      user = currentUser;
+      authToken = token;
+      _requiresReauthentication = false;
+      PlatformManager.instance.analytics.identify(
+        authMethod: authProvider,
+        userCreatedAt: currentUser.metadata.creationTime,
+      );
+      if (credential.additionalUserInfo?.isNewUser == true) {
+        PlatformManager.instance.analytics.accountCreated(authProvider: authProvider);
+      }
+      notifyListeners();
       onSignIn();
     } else {
-      AppSnackbar.showSnackbarError('Unexpected error signing in, please try again');
+      AppSnackbar.showSnackbarError(
+        globalNavigatorKey.currentContext?.l10n.authUnexpectedError ?? 'Unexpected error signing in, please try again',
+      );
     }
   }
 
   void openTermsOfService() {
-    _launchUrl('https://basedhardware.com/terms');
+    _launchUrl('https://www.omi.me/pages/terms-of-service');
   }
 
   void openPrivacyPolicy() {
@@ -126,55 +312,31 @@ class AuthenticationProvider extends BaseProvider {
   }
 
   void _launchUrl(String url) async {
-    if (!await launchUrl(Uri.parse(url))) throw 'Could not launch $url';
+    final uri = Uri.tryParse(url);
+    if (uri == null) {
+      Logger.debug('Invalid URL');
+      return;
+    }
+
+    await launchUrl(uri, mode: LaunchMode.inAppBrowserView);
   }
 
   Future<void> linkWithGoogle() async {
     setLoading(true);
     try {
-      final GoogleSignInAccount? googleUser = await GoogleSignIn().signIn();
-      if (googleUser == null) {
+      final result = await completeProviderLinkAndMigrate(
+        linkProvider: AuthService.instance.linkWithGoogle,
+        migrate: migrateAppOwnerId,
+      );
+      if (result == null) {
         setLoading(false);
         return;
       }
-
-      final GoogleSignInAuthentication googleAuth = await googleUser.authentication;
-      final credential = GoogleAuthProvider.credential(
-        accessToken: googleAuth.accessToken,
-        idToken: googleAuth.idToken,
-      );
-
-      try {
-        await FirebaseAuth.instance.currentUser?.linkWithCredential(credential);
-      } catch (e) {
-        if (e is FirebaseAuthException && e.code == 'credential-already-in-use') {
-          // Get existing user credentials
-          final existingCred = e.credential;
-          final oldUserId = FirebaseAuth.instance.currentUser?.uid;
-
-          // Sign out current anonymous user
-          await FirebaseAuth.instance.signOut();
-
-          // Sign in with existing account
-          await FirebaseAuth.instance.signInWithCredential(existingCred!);
-          final newUserId = FirebaseAuth.instance.currentUser?.uid;
-          await getIdToken();
-
-          SharedPreferencesUtil().onboardingCompleted = false;
-          SharedPreferencesUtil().uid = newUserId ?? '';
-          SharedPreferencesUtil().email = FirebaseAuth.instance.currentUser?.email ?? '';
-          SharedPreferencesUtil().givenName = FirebaseAuth.instance.currentUser?.displayName?.split(' ')[0] ?? '';
-          if (oldUserId != null && newUserId != null) {
-            await migrateAppOwnerId(oldUserId);
-          }
-          return;
-        }
-        AppSnackbar.showSnackbarError('Failed to link with Google, please try again.');
-        rethrow;
-      }
     } catch (e) {
-      print('Error linking with Google: $e');
-      AppSnackbar.showSnackbarError('Failed to link with Google, please try again.');
+      AppSnackbar.showSnackbarError(
+        globalNavigatorKey.currentContext?.l10n.authFailedToLinkGoogle ??
+            'Failed to link with Google, please try again.',
+      );
       rethrow;
     } finally {
       setLoading(false);
@@ -192,37 +354,44 @@ class AuthenticationProvider extends BaseProvider {
           // Get existing user credentials
           final existingCred = e.credential;
           final oldUserId = FirebaseAuth.instance.currentUser?.uid;
+          final sourceToken = await FirebaseAuth.instance.currentUser?.getIdToken();
 
           // Sign out current anonymous user
-          await FirebaseAuth.instance.signOut();
+          await AuthService.instance.signOutForAccountSwitch();
 
           // Sign in with existing account
           await FirebaseAuth.instance.signInWithCredential(existingCred!);
           final newUserId = FirebaseAuth.instance.currentUser?.uid;
-          await getIdToken();
+          if (newUserId != null) AuthService.instance.markAuthenticatedUser(newUserId);
+          await AuthService.instance.getIdToken();
 
           SharedPreferencesUtil().onboardingCompleted = false;
           SharedPreferencesUtil().uid = newUserId ?? '';
           SharedPreferencesUtil().email = FirebaseAuth.instance.currentUser?.email ?? '';
           SharedPreferencesUtil().givenName = FirebaseAuth.instance.currentUser?.displayName?.split(' ')[0] ?? '';
-          if (oldUserId != null && newUserId != null) {
-            await migrateAppOwnerId(oldUserId);
+          if (oldUserId != null && newUserId != null && sourceToken != null) {
+            await migrateAppOwnerId(oldUserId, sourceToken);
           }
           return;
         }
-        AppSnackbar.showSnackbarError('Failed to link with Apple, please try again.');
+        AppSnackbar.showSnackbarError(
+          globalNavigatorKey.currentContext?.l10n.authFailedToLinkApple ??
+              'Failed to link with Apple, please try again.',
+        );
         rethrow;
       }
     } catch (e) {
-      print('Error linking with Apple: $e');
-      AppSnackbar.showSnackbarError('Failed to link with Apple, please try again.');
+      Logger.debug('Error linking with Apple: $e');
+      AppSnackbar.showSnackbarError(
+        globalNavigatorKey.currentContext?.l10n.authFailedToLinkApple ?? 'Failed to link with Apple, please try again.',
+      );
       rethrow;
     } finally {
       setLoading(false);
     }
   }
 
-  Future<bool> migrateAppOwnerId(String oldId) async {
-    return await apps_api.migrateAppOwnerId(oldId);
+  Future<bool> migrateAppOwnerId(String oldId, String sourceToken) async {
+    return await apps_api.migrateAppOwnerId(oldId, sourceToken);
   }
 }

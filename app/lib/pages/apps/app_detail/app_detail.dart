@@ -1,42 +1,62 @@
-import 'package:cached_network_image/cached_network_image.dart';
-import 'package:shimmer/shimmer.dart';
-import 'package:omi/pages/apps/app_home_web_page.dart';
-import 'package:collection/collection.dart';
+import 'dart:async';
+
+import 'package:omi/utils/error_message.dart';
+import 'package:omi/utils/platform/platform_manager.dart';
 import 'package:flutter/material.dart';
-import 'package:omi/pages/apps/widgets/full_screen_image_viewer.dart';
-import 'package:flutter_rating_bar/flutter_rating_bar.dart';
-import 'package:omi/backend/http/api/apps.dart';
-import 'package:omi/backend/preferences.dart';
-import 'package:omi/pages/apps/app_detail/reviews_list_page.dart';
-import 'package:omi/pages/apps/app_detail/widgets/add_review_widget.dart';
-import 'package:omi/pages/apps/markdown_viewer.dart';
-import 'package:omi/pages/apps/providers/add_app_provider.dart';
-import 'package:omi/providers/app_provider.dart';
-import 'package:omi/providers/home_provider.dart';
-import 'package:omi/providers/message_provider.dart';
-import 'package:omi/utils/analytics/mixpanel.dart';
-import 'package:omi/utils/other/temp.dart';
-import 'package:omi/widgets/animated_loading_button.dart';
-import 'package:omi/widgets/confirmation_dialog.dart';
-import 'package:omi/widgets/dialog.dart';
-import 'package:omi/widgets/extensions/string.dart';
+
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:collection/collection.dart';
+import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:provider/provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:skeletonizer/skeletonizer.dart';
 import 'package:url_launcher/url_launcher.dart';
-import 'dart:async';
 
-import '../../../backend/schema/app.dart';
-import '../widgets/show_app_options_sheet.dart';
-import 'widgets/app_analytics_widget.dart';
+import 'package:omi/backend/http/api/apps.dart';
+import 'package:omi/backend/preferences.dart';
+import 'package:omi/utils/share_links.dart';
+import 'package:omi/pages/apps/app_detail/reviews_list_page.dart';
+import 'package:omi/pages/apps/app_detail/reviews_section.dart';
+import 'package:omi/pages/apps/app_detail/app_summary.dart';
+import 'package:omi/pages/apps/app_home_web_page.dart';
+import 'package:omi/pages/apps/markdown_viewer.dart';
+import 'package:omi/pages/apps/providers/add_app_provider.dart';
+import 'package:omi/pages/chat/chat_route.dart';
+import 'package:omi/pages/chat/page.dart';
+import 'package:omi/providers/app_provider.dart';
+import 'package:omi/providers/message_provider.dart';
+import 'package:omi/utils/logger.dart';
+import 'package:omi/utils/other/temp.dart';
+import 'package:omi/widgets/extensions/string.dart';
+import 'package:omi/utils/l10n_extensions.dart';
+import 'package:omi/backend/http/api/payment.dart';
+import 'package:omi/backend/schema/app.dart';
+import 'package:omi/pages/apps/app_detail/app_detail_config.dart';
+import 'package:omi/pages/apps/widgets/show_app_options_sheet.dart';
+import 'widgets/capabilities_card.dart';
 import 'widgets/info_card_widget.dart';
-
-import 'package:timeago/timeago.dart' as timeago;
+import 'package:omi/l10n/app_localizations.dart';
+import 'package:omi/pages/apps/app_detail/widgets/app_permissions_card.dart';
+import 'package:omi/pages/apps/app_detail/widgets/app_preview_gallery.dart';
+import 'package:omi/pages/apps/app_detail/widgets/app_setup_steps.dart';
+import 'package:omi/pages/apps/widgets/app_actions.dart';
+import 'package:omi/ui/ui.dart';
 
 class AppDetailPage extends StatefulWidget {
   final App app;
+  final bool preventAutoOpenHomePage;
+  final Future<(bool, String)> Function(String) enableApp;
+  final Future<Map<String, dynamic>?> Function(String) appDetailsLoader;
+  final Future<bool> Function(String?) setupChecker;
 
-  const AppDetailPage({super.key, required this.app});
+  const AppDetailPage({
+    super.key,
+    required this.app,
+    this.preventAutoOpenHomePage = false,
+    this.enableApp = enableAppServer,
+    this.appDetailsLoader = getAppDetailsServer,
+    this.setupChecker = isAppSetupCompleted,
+  });
 
   @override
   State<AppDetailPage> createState() => _AppDetailPageState();
@@ -47,16 +67,94 @@ class _AppDetailPageState extends State<AppDetailPage> {
   bool setupCompleted = false;
   bool appLoading = false;
   bool isLoading = false;
+  bool chatButtonLoading = false;
+  bool _reEnabling = false;
+  Map<String, dynamic>? _subscriptionData;
+  bool _isCancelingSubscription = false;
   Timer? _paymentCheckTimer;
+  Timer? _setupCheckTimer;
+  bool _paymentCheckInFlight = false;
+  bool _purchaseCompleted = false;
+  int _paymentCheckGeneration = 0;
+  int _setupCheckGeneration = 0;
+  int _markdownLoadGeneration = 0;
   late App app;
+  final ScrollController _scrollController = ScrollController();
+  final GlobalKey _reviewsSectionKey = GlobalKey();
 
-  checkSetupCompleted() {
+  /// Safely launches a URL with fallback from in-app browser to external browser.
+  /// Returns true if the URL was launched successfully, false otherwise.
+  Future<bool> _launchUrlSafely(Uri uri) async {
+    final supportsInAppBrowser = uri.scheme == 'http' || uri.scheme == 'https';
+
+    try {
+      if (supportsInAppBrowser) {
+        await launchUrl(uri, mode: LaunchMode.inAppBrowserView);
+      } else {
+        await launchUrl(uri, mode: LaunchMode.externalApplication);
+      }
+      return true;
+    } catch (e) {
+      Logger.warning('Failed to launch URL with in-app browser: $e');
+      // Fall back to external browser
+      try {
+        await launchUrl(uri, mode: LaunchMode.externalApplication);
+        return true;
+      } catch (e) {
+        Logger.warning('Failed to launch URL with external browser: $e');
+        if (mounted) {
+          OmiFeedback.error(context, context.l10n.couldNotOpenUrl);
+        }
+        return false;
+      }
+    }
+  }
+
+  checkSetupCompleted({bool autoInstallIfCompleted = false}) {
+    if (app.externalIntegration == null) {
+      _setupCheckGeneration++;
+      return;
+    }
     // TODO: move check to backend
-    isAppSetupCompleted(app.externalIntegration!.setupCompletedUrl).then((value) {
-      if (mounted) {
-        setState(() => setupCompleted = value);
+    final generation = ++_setupCheckGeneration;
+    final requestedUrl = app.externalIntegration!.setupCompletedUrl;
+    widget.setupChecker(requestedUrl).then((value) {
+      if (!mounted) return;
+      if (generation != _setupCheckGeneration) return;
+      if (app.externalIntegration?.setupCompletedUrl != requestedUrl) return;
+
+      setState(() => setupCompleted = value);
+
+      if (autoInstallIfCompleted && value && !app.enabled) {
+        _tryAutoInstallAfterSetup();
       }
     });
+  }
+
+  void _loadSetupInstructionsMarkdown() {
+    final generation = ++_markdownLoadGeneration;
+    final path = app.externalIntegration?.setupInstructionsFilePath;
+    if (path == null || path.isEmpty || !path.contains('raw.githubusercontent.com')) {
+      return;
+    }
+
+    final appId = app.id;
+    getAppMarkdown(path).then((value) {
+      if (!mounted) return;
+      if (generation != _markdownLoadGeneration) return;
+      if (app.externalIntegration?.setupInstructionsFilePath != path) return;
+
+      value = value.replaceAll(
+        '](assets/',
+        '](https://raw.githubusercontent.com/BasedHardware/Omi/main/plugins/instructions/$appId/assets/',
+      );
+      setState(() => instructionsMarkdown = value);
+    });
+  }
+
+  Future<void> _tryAutoInstallAfterSetup() async {
+    if (!mounted) return;
+    await _enableApp(app.id);
   }
 
   void setIsLoading(bool value) {
@@ -65,980 +163,818 @@ class _AppDetailPageState extends State<AppDetailPage> {
     }
   }
 
+  Future<void> _loadSubscriptionData() async {
+    if (widget.app.isPaid) {
+      final subscriptionResponse = await getAppSubscription(widget.app.id);
+      if (mounted) {
+        setState(() {
+          _subscriptionData = subscriptionResponse;
+        });
+      }
+    }
+  }
+
+  Future<void> _cancelSubscription() async {
+    setState(() => _isCancelingSubscription = true);
+
+    try {
+      final result = await cancelAppSubscription(widget.app.id);
+      if (result != null && result['status'] == 'success') {
+        // Track subscription cancellation
+        PlatformManager.instance.analytics.appDetailSubscriptionCancelled(
+          appId: widget.app.id,
+          appName: widget.app.name,
+        );
+
+        await _loadSubscriptionData();
+
+        if (mounted) OmiFeedback.confirm(context, context.l10n.subscriptionCancelledSuccessfully);
+      } else {
+        if (mounted) OmiFeedback.error(context, context.l10n.failedToCancelSubscription);
+      }
+    } catch (e) {
+      if (mounted) OmiFeedback.error(context, context.l10n.errorWithMessage(readableError(e)));
+    } finally {
+      if (mounted) {
+        setState(() => _isCancelingSubscription = false);
+      }
+    }
+  }
+
+  bool _hasActiveSubscription() {
+    if (_subscriptionData == null || _subscriptionData!['subscription'] == null) {
+      return false;
+    }
+    final subscription = _subscriptionData!['subscription'];
+    return subscription['status'] == 'active' && subscription['cancel_at_period_end'] == false;
+  }
+
   @override
   void initState() {
     app = widget.app;
+
+    // Track app detail page viewed
+    PlatformManager.instance.analytics.appDetailViewed(
+      appId: app.id,
+      appName: app.name,
+      category: app.category,
+      rating: app.ratingAvg,
+      installs: app.installs,
+      isInstalled: app.enabled,
+    );
+
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       // Automatically open app home page if conditions are met
-      if (app.enabled && app.externalIntegration?.appHomeUrl?.isNotEmpty == true) {
-        Navigator.push(
-          context,
-          MaterialPageRoute(
-            builder: (context) => AppHomeWebPage(app: app),
-          ),
-        );
+      if (!widget.preventAutoOpenHomePage && app.enabled && app.externalIntegration?.appHomeUrl?.isNotEmpty == true) {
+        routeToPage(context, AppHomeWebPage(app: app));
       }
       // Load details
-      setIsLoading(true);
-      var res = await context.read<AppProvider>().getAppDetails(app.id);
-      if (mounted) {
-        setState(() {
-          if (res != null) {
-            app = res;
-          }
-        });
-      }
-
-      setIsLoading(false);
-      context.read<AppProvider>().checkIsAppOwner(app.uid);
-      context.read<AppProvider>().setIsAppPublicToggled(!app.private);
+      await _refreshAppDetails();
     });
     if (app.worksExternally()) {
-      if (app.externalIntegration!.setupInstructionsFilePath?.isNotEmpty == true) {
-        if (app.externalIntegration!.setupInstructionsFilePath?.contains('raw.githubusercontent.com') == true) {
-          getAppMarkdown(app.externalIntegration!.setupInstructionsFilePath ?? '').then((value) {
-            value = value.replaceAll(
-              '](assets/',
-              '](https://raw.githubusercontent.com/BasedHardware/Omi/main/plugins/instructions/${app.id}/assets/',
-            );
-            setState(() => instructionsMarkdown = value);
-          });
-        }
-      }
       checkSetupCompleted();
+      _loadSetupInstructionsMarkdown();
     }
 
     super.initState();
   }
 
+  Future<void> _refreshAppDetails() async {
+    setIsLoading(true);
+    var res = await context.read<AppProvider>().getAppDetails(app.id);
+    if (mounted) {
+      setState(() {
+        if (res != null) {
+          app = res;
+        }
+      });
+    }
+
+    setIsLoading(false);
+    if (mounted) {
+      context.read<AppProvider>().checkIsAppOwner(app.uid);
+      context.read<AppProvider>().setIsAppPublicToggled(!app.private);
+      if (app.isPaid) {
+        _loadSubscriptionData();
+      }
+    }
+  }
+
+  void _onExternalIntegrationUpdated() {
+    if (!app.worksExternally()) {
+      _setupCheckGeneration++;
+      _markdownLoadGeneration++;
+      return;
+    }
+    checkSetupCompleted();
+    _loadSetupInstructionsMarkdown();
+  }
+
+  void _applyProviderAppUpdate(App updatedApp) {
+    setState(() {
+      app = updatedApp;
+    });
+    _onExternalIntegrationUpdated();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Refresh app details when returning to this page (e.g., after updating)
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      // Check if app has been updated in the provider
+      final appProvider = context.read<AppProvider>();
+      final updatedApp = appProvider.apps.firstWhereOrNull((a) => a.id == app.id);
+      if (updatedApp != null && hasAppDetailConfigChanged(app, updatedApp)) {
+        // App was updated, refresh the details
+        await _refreshAppDetails();
+        _onExternalIntegrationUpdated();
+      }
+    });
+  }
+
   @override
   void dispose() {
+    _paymentCheckGeneration++;
     _paymentCheckTimer?.cancel();
+    _setupCheckTimer?.cancel();
+    _scrollController.dispose();
     super.dispose();
   }
 
+  void _stopPaymentCheck() {
+    _paymentCheckTimer?.cancel();
+    _paymentCheckTimer = null;
+    _paymentCheckInFlight = false;
+    _paymentCheckGeneration++;
+  }
+
   Future _checkPaymentStatus(String appId) async {
-    MixpanelManager().appPurchaseStarted(appId);
+    PlatformManager.instance.analytics.appPurchaseStarted(appId);
+    _paymentCheckTimer?.cancel();
+    _paymentCheckInFlight = false;
+    _purchaseCompleted = false;
+    final generation = ++_paymentCheckGeneration;
     _paymentCheckTimer = Timer.periodic(const Duration(seconds: 5), (timer) async {
-      var prefs = SharedPreferencesUtil();
-      if (mounted) {
+      if (!mounted || app.id != appId || generation != _paymentCheckGeneration) {
+        timer.cancel();
+        return;
+      }
+      if (timer.tick >= 60) {
+        _stopPaymentCheck();
+        if (mounted) {
+          setState(() => appLoading = false);
+          OmiFeedback.error(context, context.l10n.issueActivatingApp);
+        }
+        return;
+      }
+      if (_paymentCheckInFlight) return;
+      _paymentCheckInFlight = true;
+      if (!appLoading) {
         setState(() => appLoading = true);
       }
-
-      var details = await getAppDetailsServer(appId);
-      if (details != null && details['is_user_paid']) {
-        var enabled = await enableAppServer(appId);
-        if (enabled) {
-          MixpanelManager().appPurchaseCompleted(appId);
-          prefs.enableApp(appId);
-          MixpanelManager().appEnabled(appId);
-          context.read<AppProvider>().setApps();
-          setState(() {
-            app.isUserPaid = true;
-            app.enabled = true;
-            appLoading = false;
-          });
-          timer.cancel();
-          _paymentCheckTimer?.cancel();
-        } else {
-          debugPrint('Payment not made yet');
+      var confirmed = false;
+      try {
+        final details = await widget.appDetailsLoader(appId);
+        confirmed = details != null && details['is_user_paid'] == true;
+      } catch (_) {
+        confirmed = false;
+      } finally {
+        if (generation == _paymentCheckGeneration) {
+          _paymentCheckInFlight = false;
         }
+      }
+      if (!mounted || generation != _paymentCheckGeneration) return;
+      if (confirmed) {
+        _stopPaymentCheck();
+        app.isUserPaid = true;
+        if (!_purchaseCompleted) {
+          _purchaseCompleted = true;
+          PlatformManager.instance.analytics.appPurchaseCompleted(appId);
+        }
+        await _enableApp(appId);
+        return;
+      }
+      if (appLoading) {
+        setState(() => appLoading = false);
       }
     });
   }
 
   @override
   Widget build(BuildContext context) {
-    bool isIntegration = app.worksExternally();
-    bool hasSetupInstructions = isIntegration && app.externalIntegration?.setupInstructionsFilePath?.isNotEmpty == true;
-    bool hasAuthSteps = isIntegration && app.externalIntegration?.authSteps.isNotEmpty == true;
-    int stepsCount = app.externalIntegration?.authSteps.length ?? 0;
-    return Scaffold(
-      appBar: AppBar(
-        backgroundColor: Theme.of(context).colorScheme.primary,
-        elevation: 0,
-        actions: [
-          if (app.enabled && app.worksWithChat()) ...[
-            GestureDetector(
-              child: const Icon(Icons.question_answer),
-              onTap: () async {
-                Navigator.pop(context);
-                context.read<HomeProvider>().setIndex(1);
-                if (context.read<HomeProvider>().onSelectedIndexChanged != null) {
-                  context.read<HomeProvider>().onSelectedIndexChanged!(1);
-                }
-                var appId = app.id;
-                var appProvider = Provider.of<AppProvider>(context, listen: false);
-                var messageProvider = Provider.of<MessageProvider>(context, listen: false);
-                App? selectedApp;
-                if (appId.isNotEmpty) {
-                  selectedApp = await appProvider.getAppFromId(appId);
-                }
-                appProvider.setSelectedChatAppId(appId);
-                await messageProvider.refreshMessages();
-                if (messageProvider.messages.isEmpty) {
-                  messageProvider.sendInitialAppMessage(selectedApp);
-                }
-              },
-            ),
-            const SizedBox(width: 24),
-          ],
-          if (app.enabled && app.externalIntegration?.appHomeUrl?.isNotEmpty == true) ...[
-            GestureDetector(
-              child: const Icon(
-                Icons.open_in_browser_rounded,
-                color: Colors.white,
-              ),
-              onTap: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (context) => AppHomeWebPage(app: app),
+    // Watch for changes to the app in AppProvider and update local state
+    return Consumer<AppProvider>(
+      builder: (context, appProvider, child) {
+        // Check if app has been updated in the provider
+        final updatedApp = appProvider.apps.firstWhereOrNull((a) => a.id == app.id);
+        if (updatedApp != null && hasAppDetailConfigChanged(app, updatedApp)) {
+          // Update local app state when provider's app changes
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) {
+              _applyProviderAppUpdate(updatedApp);
+            }
+          });
+        }
+
+        final l10n = context.l10n;
+        bool isIntegration = app.worksExternally();
+        bool hasSetupInstructions =
+            isIntegration && app.externalIntegration?.setupInstructionsFilePath?.isNotEmpty == true;
+        bool hasAuthSteps = isIntegration && app.externalIntegration?.authSteps.isNotEmpty == true;
+        return Scaffold(
+          appBar: AppBar(
+            elevation: 0,
+            automaticallyImplyLeading: false,
+            leading: const Center(child: OmiBackButton.circled()),
+            actions: [
+              if (app.enabled && app.worksWithChat())
+                OmiIconButton.filled(
+                  icon: chatButtonLoading
+                      ? const OmiSpinner(size: OmiSpinnerSize.small)
+                      : const FaIcon(FontAwesomeIcons.solidComments, size: 16),
+                  label: l10n.chatWithApp(app.name.decodeString),
+                  onPressed: chatButtonLoading ? null : _openChatWithApp,
+                ),
+              if (app.enabled && app.externalIntegration?.appHomeUrl?.isNotEmpty == true)
+                OmiIconButton.filled(
+                  icon: const FaIcon(FontAwesomeIcons.gear, size: 16),
+                  label: l10n.appSettingsLabel(app.name.decodeString),
+                  onPressed: () => routeToPage(context, AppHomeWebPage(app: app)),
+                ),
+              if (!isLoading && !app.private)
+                Builder(
+                  builder: (context) => OmiIconButton.filled(
+                    icon: const FaIcon(FontAwesomeIcons.arrowUpFromBracket, size: 16),
+                    label: l10n.share,
+                    onPressed: () => _shareApp(context),
                   ),
-                );
-              },
-            ),
-            const SizedBox(width: 24),
-          ],
-          isLoading || app.private
-              ? const SizedBox.shrink()
-              : GestureDetector(
-                  child: const Icon(Icons.share),
-                  onTap: () {
-                    MixpanelManager().track('App Shared', properties: {'appId': app.id});
-                    if (app.isNotPersona()) {
-                      Share.share(
-                        'Check out this app on Omi AI: ${app.name} by ${app.author} \n\n${app.description.decodeString}\n\n\nhttps://h.omi.me/apps/${app.id}',
-                        subject: app.name,
-                      );
-                    } else {
-                      Share.share(
-                        'Check out this Persona on Omi AI: ${app.name} by ${app.author} \n\n${app.description.decodeString}\n\n\nhttps://personas.omi.me/u/${app.username}',
-                        subject: app.name,
-                      );
-                    }
-                  },
                 ),
-          !context.watch<AppProvider>().isAppOwner
-              ? const SizedBox(
-                  width: 24,
-                )
-              : const SizedBox(
-                  width: 12,
+              if (appProvider.isAppOwner && !isLoading)
+                OmiIconButton.filled(
+                  icon: const FaIcon(FontAwesomeIcons.penToSquare, size: 16),
+                  label: l10n.appOptions,
+                  onPressed: () => showAppOptionsSheet(context, app),
                 ),
-          context.watch<AppProvider>().isAppOwner
-              ? (isLoading
-                  ? const SizedBox.shrink()
-                  : IconButton(
-                      icon: const Icon(Icons.settings),
-                      padding: const EdgeInsets.only(right: 12),
-                      onPressed: () async {
-                        await showModalBottomSheet(
-                          context: context,
-                          shape: const RoundedRectangleBorder(
-                            borderRadius: BorderRadius.only(
-                              topLeft: Radius.circular(16),
-                              topRight: Radius.circular(16),
-                            ),
-                          ),
-                          builder: (context) {
-                            return ShowAppOptionsSheet(
-                              app: app,
-                            );
-                          },
-                        );
-                      },
-                    ))
-              : const SizedBox.shrink(),
-        ],
-      ),
-      backgroundColor: Theme.of(context).colorScheme.primary,
-      body: SingleChildScrollView(
-        child: Skeletonizer(
-          enabled: isLoading,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const SizedBox(height: 20),
-              Row(
+              const SizedBox(width: OmiSpacing.xxs),
+            ],
+          ),
+          body: SingleChildScrollView(
+            controller: _scrollController,
+            child: Skeletonizer(
+              enabled: isLoading,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const SizedBox(width: 20),
-                  CachedNetworkImage(
-                    imageUrl: app.getImageUrl(),
-                    imageBuilder: (context, imageProvider) => Container(
-                      width: 48,
-                      height: 48,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.rectangle,
-                        borderRadius: BorderRadius.circular(8),
-                        image: DecorationImage(image: imageProvider, fit: BoxFit.cover),
-                      ),
-                    ),
-                    placeholder: (context, url) => const CircularProgressIndicator(),
-                    errorWidget: (context, url, error) => const Icon(Icons.error),
-                  ),
-                  const SizedBox(width: 20),
-                  Column(
-                    mainAxisAlignment: MainAxisAlignment.start,
+                  const SizedBox(height: 20),
+                  Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      SizedBox(
-                        width: MediaQuery.of(context).size.width * 0.6,
-                        child: Text(
-                          app.name.decodeString,
-                          style: const TextStyle(color: Colors.white, fontSize: 20),
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        app.author.decodeString,
-                        style: const TextStyle(color: Colors.grey, fontSize: 14),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-              const SizedBox(height: 24),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const Spacer(),
-                  app.ratingCount == 0
-                      ? const Column(
-                          children: [
-                            Text(
-                              '0.0',
-                              style: TextStyle(
-                                fontSize: 16,
-                              ),
-                            ),
-                            SizedBox(height: 4),
-                            Text("no reviews"),
-                          ],
-                        )
-                      : Column(
-                          children: [
-                            Row(
-                              children: [
-                                Text(
-                                  app.getRatingAvg() ?? '0.0',
-                                  style: const TextStyle(
-                                    fontSize: 16,
-                                  ),
-                                ),
-                                RatingBar.builder(
-                                  initialRating: app.ratingAvg ?? 0,
-                                  minRating: 1,
-                                  ignoreGestures: true,
-                                  direction: Axis.horizontal,
-                                  allowHalfRating: true,
-                                  itemCount: 1,
-                                  itemSize: 20,
-                                  tapOnlyMode: false,
-                                  itemPadding: const EdgeInsets.symmetric(horizontal: 0),
-                                  itemBuilder: (context, _) => const Icon(Icons.star, color: Colors.deepPurple),
-                                  maxRating: 5.0,
-                                  onRatingUpdate: (rating) {},
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 4),
-                            Text('${app.ratingCount}+ reviews'),
-                          ],
-                        ),
-                  const Spacer(),
-                  const SizedBox(
-                    height: 36,
-                    child: VerticalDivider(
-                      color: Colors.white,
-                      endIndent: 2,
-                      indent: 2,
-                      width: 4,
-                    ),
-                  ),
-                  const Spacer(),
-                  Column(
-                    children: [
-                      Text(
-                        '${(app.installs / 10).round() * 10}+',
-                        style: const TextStyle(
-                          fontSize: 16,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      const Text("installs"),
-                    ],
-                  ),
-                  const Spacer(),
-                  const SizedBox(
-                    height: 36,
-                    child: VerticalDivider(
-                      color: Colors.white,
-                      endIndent: 2,
-                      indent: 2,
-                      width: 4,
-                    ),
-                  ),
-                  const Spacer(),
-                  Column(
-                    children: [
-                      Text(
-                        app.private ? 'Private' : 'Public',
-                        style: const TextStyle(
-                          fontSize: 16,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      const Text("app"),
-                    ],
-                  ),
-                  const Spacer(),
-                ],
-              ),
-              const SizedBox(height: 24),
-              isLoading
-                  ? Center(
-                      child: Padding(
-                        padding: const EdgeInsets.all(8.0),
-                        child: AnimatedLoadingButton(
-                          text: '',
-                          width: MediaQuery.of(context).size.width * 0.9,
-                          onPressed: () async {},
-                          color: Colors.grey.shade800,
-                        ),
-                      ),
-                    )
-                  : app.enabled
-                      ? Center(
-                          child: Padding(
-                            padding: const EdgeInsets.all(8.0),
-                            child: AnimatedLoadingButton(
-                              text: 'Uninstall App',
-                              width: MediaQuery.of(context).size.width * 0.9,
-                              onPressed: () => _toggleApp(app.id, false),
-                              color: Colors.red,
-                            ),
+                      const SizedBox(width: 20),
+                      CachedNetworkImage(
+                        imageUrl: app.getImageUrl(),
+                        imageBuilder: (context, imageProvider) => Container(
+                          width: 108,
+                          height: 108,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.rectangle,
+                            borderRadius: OmiRadius.xlAll,
+                            image: DecorationImage(image: imageProvider, fit: BoxFit.cover),
                           ),
+                        ),
+                        placeholder: (context, url) =>
+                            const SizedBox.square(dimension: 108, child: Center(child: OmiSpinner())),
+                        errorWidget: (context, url, error) => const FaIcon(FontAwesomeIcons.circleExclamation),
+                      ),
+                      const SizedBox(width: 20),
+                      Expanded(
+                        child: AppDetailSummary(
+                          name: app.name.decodeString,
+                          author: app.author.decodeString,
+                          official: app.official,
+                          ratingCount: app.ratingCount,
+                          rating: app.getRatingAvg(),
+                          installs: app.installs,
+                          onRatingTap: () {
+                            if (app.ratingCount > 0 && _reviewsSectionKey.currentContext != null) {
+                              Scrollable.ensureVisible(
+                                _reviewsSectionKey.currentContext!,
+                                duration: const Duration(milliseconds: 300),
+                                curve: Curves.easeInOut,
+                              );
+                            }
+                          },
+                          action: _buildPrimaryAction(l10n),
+                        ),
+                      ),
+                      const SizedBox(width: 20),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  if (!isLoading && !app.private && app.isPaid && _hasActiveSubscription() && !appProvider.isAppOwner)
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(OmiSpacing.lg, OmiSpacing.md, OmiSpacing.lg, 0),
+                      child: OmiButton.destructive(
+                        label: l10n.cancelSubscriptionButton,
+                        isLoading: _isCancelingSubscription,
+                        expand: true,
+                        onPressed: () {
+                          _confirmCancelSubscription();
+                        },
+                      ),
+                    ),
+                  if ((app.isUnderReview() || app.private) && !app.isOwner(SharedPreferencesUtil().uid))
+                    AppDetailNotice(icon: FontAwesomeIcons.circleInfo, text: l10n.betaTesterMessage),
+                  if (app.isUnderReview() && !app.private && app.isOwner(SharedPreferencesUtil().uid))
+                    AppDetailNotice(icon: FontAwesomeIcons.circleInfo, text: l10n.appUnderReviewMessage),
+                  if (app.isRejected())
+                    AppDetailNotice(icon: FontAwesomeIcons.circleExclamation, text: l10n.appRejectedMessage),
+                  if (app.isDisabled()) _buildDisabledNotice(),
+                  const SizedBox(height: OmiSpacing.xl),
+                  if (hasAuthSteps)
+                    AppSetupSteps(
+                      steps: app.externalIntegration!.authSteps,
+                      completed: setupCompleted,
+                      onStepTap: (step) async {
+                        final uri = Uri.tryParse(appSetupUrlWithUid(step.url, SharedPreferencesUtil().uid));
+                        if (uri == null) {
+                          OmiFeedback.error(context, l10n.invalidIntegrationUrl);
+                          return;
+                        }
+                        await _launchUrlSafely(uri);
+                        checkSetupCompleted(autoInstallIfCompleted: true);
+                      },
+                    ),
+                  if (!hasAuthSteps && hasSetupInstructions)
+                    ListTile(
+                      onTap: () async {
+                        await _openSetupInstructions();
+                        checkSetupCompleted();
+                      },
+                      trailing: Padding(
+                        padding: const EdgeInsets.only(right: OmiSpacing.sm),
+                        child: FaIcon(FontAwesomeIcons.chevronRight, size: 20, color: OmiColors.textTertiary),
+                      ),
+                      title: Text(l10n.integrationInstructions, style: OmiType.headline),
+                    ),
+                  if (app.thumbnailUrls.isNotEmpty)
+                    AppPreviewGallery(
+                      imageUrls: app.thumbnailUrls,
+                      onImageOpened: (index) => PlatformManager.instance.analytics.appDetailPreviewImageViewed(
+                        appId: app.id,
+                        imageIndex: index,
+                      ),
+                    ),
+                  InfoCardWidget(
+                    onTap: () {
+                      if (app.description.decodeString.characters.length > 200) {
+                        routeToPage(
+                          context,
+                          MarkdownViewer(title: l10n.descriptionLabel, markdown: app.description.decodeString),
+                        );
+                      }
+                    },
+                    title: l10n.descriptionLabel,
+                    description: app.description,
+                    showChips: false,
+                  ),
+                  Builder(
+                    builder: (context) {
+                      final allCapabilities = context.read<AddAppProvider>().capabilities;
+                      var capabilitiesList = app.getCapabilitiesFromIds(allCapabilities);
+
+                      // If app has chat tools, add chat capability if not already present
+                      if (app.chatTools != null && app.chatTools!.isNotEmpty) {
+                        final hasChatCapability = capabilitiesList.any((cap) => cap.id == 'chat');
+                        if (!hasChatCapability) {
+                          final chatCapability = allCapabilities.firstWhereOrNull((cap) => cap.id == 'chat');
+                          if (chatCapability != null) {
+                            capabilitiesList = [...capabilitiesList, chatCapability];
+                          }
+                        }
+
+                        // Add "Push to Talk" capability
+                        final hasPushToTalkCapability = capabilitiesList.any((cap) => cap.id == 'push_to_talk');
+                        if (!hasPushToTalkCapability) {
+                          capabilitiesList = [
+                            ...capabilitiesList,
+                            AppCapability(title: context.l10n.pushToTalk, id: 'push_to_talk'),
+                          ];
+                        }
+                      }
+
+                      // Filter out external_integration capability
+                      capabilitiesList = capabilitiesList.where((cap) => cap.id != 'external_integration').toList();
+
+                      return CapabilitiesCard(capabilities: capabilitiesList);
+                    },
+                  ),
+                  AppChatToolsCard(app: app),
+                  app.conversationPrompt != null
+                      ? InfoCardWidget(
+                          onTap: () {
+                            routeToPage(
+                              context,
+                              MarkdownViewer(
+                                title: context.l10n.summaryPrompt,
+                                markdown: app.conversationPrompt!.decodeString,
+                              ),
+                            );
+                          },
+                          title: context.l10n.summaryPrompt,
+                          description: app.conversationPrompt!,
+                          showChips: false,
+                          maxLines: 3,
                         )
-                      : (app.isPaid && !app.isUserPaid
-                          ? Center(
-                              child: Padding(
-                                padding: const EdgeInsets.all(8.0),
-                                child: AnimatedLoadingButton(
-                                  width: MediaQuery.of(context).size.width * 0.9,
-                                  text: "Subscribe",
-                                  onPressed: () async {
-                                    if (app.paymentLink != null && app.paymentLink!.isNotEmpty) {
-                                      _checkPaymentStatus(app.id);
-                                      await launchUrl(Uri.parse(app.paymentLink!));
-                                    } else {
-                                      await _toggleApp(app.id, true);
-                                    }
-                                  },
-                                  color: Colors.green,
+                      : const SizedBox.shrink(),
+                  app.chatPrompt != null
+                      ? InfoCardWidget(
+                          onTap: () {
+                            routeToPage(
+                              context,
+                              MarkdownViewer(
+                                title: context.l10n.chatPersonality,
+                                markdown: app.chatPrompt!.decodeString,
+                              ),
+                            );
+                          },
+                          title: context.l10n.chatPersonality,
+                          description: app.chatPrompt!,
+                          showChips: false,
+                          maxLines: 3,
+                        )
+                      : const SizedBox.shrink(),
+                  AppPermissionsCard(app: app),
+                  Builder(
+                    builder: (context) {
+                      final canAddReview = !app.isOwner(SharedPreferencesUtil().uid) && app.enabled;
+                      // The header already shows the average and count, so this card holds only reviews.
+                      return (app.reviews.isNotEmpty || canAddReview)
+                          ? GestureDetector(
+                              key: _reviewsSectionKey,
+                              onTap: () {
+                                if (app.reviews.isNotEmpty) {
+                                  PlatformManager.instance.analytics.appDetailReviewsOpened(
+                                    appId: app.id,
+                                    reviewCount: app.reviews.length,
+                                  );
+                                  routeToPage(context, ReviewsListPage(app: app));
+                                }
+                              },
+                              child: AppDetailSectionCard(
+                                title: l10n.ratingsAndReviews,
+                                trailing: app.reviews.isNotEmpty
+                                    ? const ExcludeSemantics(child: Icon(Icons.arrow_forward, size: 20))
+                                    : null,
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    RecentReviewsSection(
+                                      reviews:
+                                          app.reviews.sorted((a, b) => b.ratedAt.compareTo(a.ratedAt)).take(3).toList(),
+                                      userReview: app.userReview,
+                                      app: app,
+                                      onReviewUpdated: () => setState(() {}),
+                                    ),
+                                  ],
                                 ),
                               ),
                             )
-                          : Center(
-                              child: Padding(
-                                padding: const EdgeInsets.all(8.0),
-                                child: AnimatedLoadingButton(
-                                  width: MediaQuery.of(context).size.width * 0.9,
-                                  text: 'Install App',
-                                  onPressed: () async {
-                                    if (app.worksExternally()) {
-                                      showDialog(
-                                        context: context,
-                                        builder: (ctx) {
-                                          return StatefulBuilder(builder: (ctx, setState) {
-                                            return ConfirmationDialog(
-                                              title: 'Data Access Notice',
-                                              description:
-                                                  'This app will access your data. Omi AI is not responsible for how your data is used, modified, or deleted by this app',
-                                              onConfirm: () {
-                                                _toggleApp(app.id, true);
-                                                Navigator.pop(context);
-                                              },
-                                              onCancel: () {
-                                                Navigator.pop(context);
-                                              },
-                                            );
-                                          });
-                                        },
-                                      );
-                                    } else {
-                                      _toggleApp(app.id, true);
-                                    }
-                                  },
-                                  color: Colors.green,
-                                ),
-                              ),
-                            )),
-
-              (app.isUnderReview() || app.private) && !app.isOwner(SharedPreferencesUtil().uid)
-                  ? Column(
-                      children: [
-                        const SizedBox(
-                          height: 10,
-                        ),
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            const Icon(
-                              Icons.info_outline,
-                              color: Colors.grey,
-                              size: 18,
-                            ),
-                            const SizedBox(width: 10),
-                            SizedBox(
-                              width: MediaQuery.of(context).size.width * 0.78,
-                              child: const Text(
-                                  'You are a beta tester for this app. It is not public yet. It will be public once approved.',
-                                  style: TextStyle(color: Colors.grey)),
-                            ),
-                          ],
-                        ),
-                      ],
-                    )
-                  : const SizedBox.shrink(),
-              app.isUnderReview() && !app.private && app.isOwner(SharedPreferencesUtil().uid)
-                  ? Column(
-                      children: [
-                        const SizedBox(
-                          height: 10,
-                        ),
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            const Icon(
-                              Icons.info_outline,
-                              color: Colors.grey,
-                              size: 18,
-                            ),
-                            const SizedBox(width: 10),
-                            SizedBox(
-                              width: MediaQuery.of(context).size.width * 0.78,
-                              child: const Text(
-                                  'Your app is under review and visible only to you. It will be public once approved.',
-                                  style: TextStyle(color: Colors.grey)),
-                            ),
-                          ],
-                        ),
-                      ],
-                    )
-                  : const SizedBox.shrink(),
-              app.isRejected()
-                  ? Column(
-                      children: [
-                        const SizedBox(
-                          height: 10,
-                        ),
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            const Icon(
-                              Icons.error_outline,
-                              color: Colors.grey,
-                              size: 18,
-                            ),
-                            const SizedBox(width: 10),
-                            SizedBox(
-                              width: MediaQuery.of(context).size.width * 0.78,
-                              child: const Text(
-                                'Your app has been rejected. Please update the app details and resubmit for review.',
-                                style: TextStyle(color: Colors.grey),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ],
-                    )
-                  : const SizedBox.shrink(),
-              const SizedBox(height: 16),
-              (hasAuthSteps && stepsCount > 0)
-                  ? Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 16),
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text(
-                            'Setup Steps',
-                            style: TextStyle(color: Colors.white, fontSize: 18),
-                          ),
-                          setupCompleted
-                              ? const Padding(
-                                  padding: EdgeInsets.only(right: 12.0),
-                                  child: Text(
-                                    '✅',
-                                    style: TextStyle(color: Colors.grey, fontSize: 18),
-                                  ),
-                                )
-                              : const SizedBox(),
-                        ],
-                      ),
-                    )
-                  : const SizedBox.shrink(),
-              ...(hasAuthSteps
-                  ? app.externalIntegration!.authSteps.mapIndexed<Widget>((i, step) {
-                      String title = stepsCount == 0 ? step.name : '${i + 1}. ${step.name}';
-                      // String title = stepsCount == 1 ? step.name : '${i + 1}. ${step.name}';
-                      return ListTile(
-                          title: Text(
-                            title,
-                            style: const TextStyle(fontSize: 17),
-                          ),
-                          onTap: () async {
-                            await launchUrl(Uri.parse("${step.url}?uid=${SharedPreferencesUtil().uid}"));
-                            checkSetupCompleted();
-                          },
-                          trailing: const Padding(
-                            padding: EdgeInsets.only(right: 12.0),
-                            child: Icon(Icons.arrow_forward_ios, size: 20, color: Colors.grey),
-                          ));
-                    }).toList()
-                  : <Widget>[const SizedBox.shrink()]),
-              !hasAuthSteps && hasSetupInstructions
-                  ? ListTile(
-                      onTap: () async {
-                        if (app.externalIntegration != null) {
-                          if (app.externalIntegration!.setupInstructionsFilePath
-                                  ?.contains('raw.githubusercontent.com') ==
-                              true) {
-                            await routeToPage(
-                              context,
-                              MarkdownViewer(title: 'Setup Instructions', markdown: instructionsMarkdown ?? ''),
-                            );
-                          } else {
-                            if (app.externalIntegration!.isInstructionsUrl == true) {
-                              await launchUrl(Uri.parse(app.externalIntegration!.setupInstructionsFilePath ?? ''));
-                            } else {
-                              var m = app.externalIntegration!.setupInstructionsFilePath;
-                              routeToPage(context, MarkdownViewer(title: 'Setup Instructions', markdown: m ?? ''));
-                            }
-                          }
-                        }
-                        checkSetupCompleted();
-                      },
-                      trailing: const Padding(
-                        padding: EdgeInsets.only(right: 12.0),
-                        child: Icon(Icons.arrow_forward_ios, size: 20, color: Colors.grey),
-                      ),
-                      title: const Text(
-                        'Integration Instructions',
-                        style: TextStyle(fontWeight: FontWeight.w500, fontSize: 18),
-                      ),
-                    )
-                  : const SizedBox.shrink(),
-              if (app.thumbnailUrls.isNotEmpty) ...[
-                const Padding(
-                  padding: EdgeInsets.symmetric(horizontal: 16.0, vertical: 16),
-                  child: Text(
-                    'Preview',
-                    style: TextStyle(color: Colors.white, fontSize: 18),
-                  ),
-                ),
-                SizedBox(
-                  height: MediaQuery.of(context).size.width * 0.9,
-                  child: ListView.builder(
-                    padding: EdgeInsets.zero,
-                    scrollDirection: Axis.horizontal,
-                    itemCount: app.thumbnailUrls.length,
-                    itemBuilder: (context, index) {
-                      final screenWidth = MediaQuery.of(context).size.width;
-                      // Calculate width to show 1.5 thumbnails
-                      final width = screenWidth * 0.65;
-                      // Calculate height to maintain 2:3 ratio (height = width * 1.5)
-                      final height = width * 1.5;
-
-                      return GestureDetector(
-                        onTap: () {
-                          Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                              builder: (context) => FullScreenImageViewer(
-                                imageUrl: app.thumbnailUrls[index],
-                              ),
-                            ),
-                          );
-                        },
-                        child: CachedNetworkImage(
-                          imageUrl: app.thumbnailUrls[index],
-                          imageBuilder: (context, imageProvider) => Container(
-                            width: width,
-                            height: height,
-                            clipBehavior: Clip.hardEdge,
-                            margin: EdgeInsets.only(
-                              left: index == 0 ? 16 : 8,
-                              right: index == app.thumbnailUrls.length - 1 ? 16 : 8,
-                            ),
-                            decoration: BoxDecoration(
-                              borderRadius: BorderRadius.circular(12),
-                              border: Border.all(
-                                color: const Color(0xFF424242),
-                                width: 1,
-                              ),
-                              image: DecorationImage(
-                                image: imageProvider,
-                                fit: BoxFit.cover,
-                              ),
-                            ),
-                          ),
-                          placeholder: (context, url) => Shimmer.fromColors(
-                            baseColor: Colors.grey[900]!,
-                            highlightColor: Colors.grey[800]!,
-                            child: Container(
-                              width: width,
-                              height: height,
-                              margin: EdgeInsets.only(
-                                left: index == 0 ? 16 : 8,
-                                right: index == app.thumbnailUrls.length - 1 ? 16 : 8,
-                              ),
-                              decoration: BoxDecoration(
-                                color: Colors.black,
-                                borderRadius: BorderRadius.circular(12),
-                              ),
-                            ),
-                          ),
-                          errorWidget: (context, url, error) => Container(
-                            width: width,
-                            height: height,
-                            margin: EdgeInsets.only(
-                              left: index == 0 ? 16 : 8,
-                              right: index == app.thumbnailUrls.length - 1 ? 16 : 8,
-                            ),
-                            decoration: BoxDecoration(
-                              color: Colors.grey[900],
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                            child: const Icon(Icons.error),
-                          ),
-                        ),
-                      );
+                          : const SizedBox.shrink();
                     },
                   ),
-                ),
-                const SizedBox(height: 16),
-              ],
-              InfoCardWidget(
-                onTap: () {
-                  if (app.description.decodeString.characters.length > 200) {
-                    routeToPage(
-                        context,
-                        MarkdownViewer(
-                            title: 'About the ${app.isNotPersona() ? 'App' : 'Persona'}',
-                            markdown: app.description.decodeString));
-                  }
-                },
-                title: 'About the ${app.isNotPersona() ? 'App' : 'Persona'}',
-                description: app.description,
-                showChips: true,
-                capabilityChips: app
-                    .getCapabilitiesFromIds(context.read<AddAppProvider>().capabilities)
-                    .map((e) => e.title)
-                    .toList(),
-                connectionChips: app.getConnectedAccountNames(),
+                  const SizedBox(height: 60),
+                ],
               ),
-
-              app.conversationPrompt != null
-                  ? InfoCardWidget(
-                      onTap: () {
-                        if (app.conversationPrompt!.decodeString.characters.length > 200) {
-                          routeToPage(
-                              context,
-                              MarkdownViewer(
-                                  title: 'Conversation Prompt', markdown: app.conversationPrompt!.decodeString));
-                        }
-                      },
-                      title: 'Conversation Prompt',
-                      description: app.conversationPrompt!,
-                      showChips: false,
-                    )
-                  : const SizedBox.shrink(),
-
-              app.chatPrompt != null
-                  ? InfoCardWidget(
-                      onTap: () {
-                        if (app.chatPrompt!.decodeString.characters.length > 200) {
-                          routeToPage(context,
-                              MarkdownViewer(title: 'Chat Personality', markdown: app.chatPrompt!.decodeString));
-                        }
-                      },
-                      title: 'Chat Personality',
-                      description: app.chatPrompt!,
-                      showChips: false,
-                    )
-                  : const SizedBox.shrink(),
-              GestureDetector(
-                onTap: () {
-                  if (app.reviews.isNotEmpty) {
-                    routeToPage(context, ReviewsListPage(app: app));
-                  }
-                },
-                child: Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.all(16.0),
-                  margin: const EdgeInsets.only(left: 8.0, right: 8.0, top: 12, bottom: 6),
-                  decoration: BoxDecoration(
-                    color: Colors.grey.shade900,
-                    borderRadius: BorderRadius.circular(16.0),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Row(
-                        children: [
-                          const Text('Ratings & Reviews', style: TextStyle(color: Colors.white, fontSize: 18)),
-                          const Spacer(),
-                          app.reviews.isNotEmpty
-                              ? const Icon(
-                                  Icons.arrow_forward,
-                                  size: 20,
-                                )
-                              : const SizedBox.shrink(),
-                        ],
-                      ),
-                      const SizedBox(height: 20),
-                      Row(
-                        children: [
-                          Text(app.getRatingAvg() ?? '0.0',
-                              style: const TextStyle(fontSize: 38, fontWeight: FontWeight.bold)),
-                          const Spacer(),
-                          Column(
-                            children: [
-                              Skeleton.ignore(
-                                child: RatingBar.builder(
-                                  initialRating: app.ratingAvg ?? 0,
-                                  minRating: 1,
-                                  ignoreGestures: true,
-                                  direction: Axis.horizontal,
-                                  allowHalfRating: true,
-                                  itemCount: 5,
-                                  itemSize: 20,
-                                  tapOnlyMode: false,
-                                  itemPadding: const EdgeInsets.symmetric(horizontal: 0),
-                                  itemBuilder: (context, _) => const Icon(Icons.star, color: Colors.deepPurple),
-                                  maxRating: 5.0,
-                                  onRatingUpdate: (rating) {},
-                                ),
-                              ),
-                              const SizedBox(height: 4),
-                              Text(app.ratingCount <= 0 ? "no ratings" : "${app.ratingCount}+ ratings"),
-                            ],
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 16),
-                      RecentReviewsSection(
-                        reviews: app.reviews.sorted((a, b) => b.ratedAt.compareTo(a.ratedAt)).take(3).toList(),
-                        appAuthor: app.author,
-                      )
-                    ],
-                  ),
-                ),
-              ),
-              !app.isOwner(SharedPreferencesUtil().uid) && (app.enabled || app.userReview != null)
-                  ? AddReviewWidget(app: app)
-                  : const SizedBox.shrink(),
-              // isIntegration ? const SizedBox(height: 16) : const SizedBox.shrink(),
-              // widget.plugin.worksExternally() ? const SizedBox(height: 16) : const SizedBox.shrink(),
-              // app.private
-              //     ? const SizedBox.shrink()
-              //     : AppAnalyticsWidget(
-              //         installs: app.installs, moneyMade: app.isPaid ? ((app.price ?? 0) * app.installs) : 0),
-              const SizedBox(height: 60),
-            ],
+            ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 
-  Future<void> _toggleApp(String appId, bool isEnabled) async {
-    var prefs = SharedPreferencesUtil();
-    setState(() => appLoading = true);
-    if (isEnabled) {
-      var enabled = await enableAppServer(appId);
-      if (!enabled) {
-        if (mounted) {
-          showDialog(
-            context: context,
-            builder: (c) => getDialog(
-              context,
-              () => Navigator.pop(context),
-              () => Navigator.pop(context),
-              'Error activating the app',
-              'If this is an integration app, make sure the setup is completed.',
-              singleButton: true,
-            ),
-          );
-        }
+  /// Shown when the backend has latched `disabled` on the app.
+  ///
+  /// Nothing surfaced this state before, so a disabled app read as healthy here
+  /// while every install failed, and the owner had no control that could clear it.
+  Widget _buildDisabledNotice() {
+    final isOwner = app.isOwner(SharedPreferencesUtil().uid);
+    final reason = app.disabledReason == 'webhook_failures'
+        ? context.l10n.appDisabledWebhookFailures
+        : context.l10n.appDisabledGeneric;
+    final when = app.disabledAt != null && app.disabledAt!.length >= 10
+        ? ' ${context.l10n.appDisabledOn(app.disabledAt!.substring(0, 10))}'
+        : '';
+    final lastError = app.disabledError != null && app.disabledError!.isNotEmpty
+        ? ' ${context.l10n.appDisabledLastError(app.disabledError!)}'
+        : '';
 
-        setState(() => appLoading = false);
+    return Column(
+      children: [
+        AppDetailNotice(
+          icon: FontAwesomeIcons.triangleExclamation,
+          text: '${context.l10n.appDisabledTitle} $reason$when$lastError',
+        ),
+        if (isOwner) ...[
+          const SizedBox(height: OmiSpacing.sm),
+          SizedBox(
+            width: MediaQuery.sizeOf(context).width * 0.78,
+            child: Text(
+              context.l10n.appDisabledOwnerHint,
+              style: OmiType.footnote.copyWith(color: OmiColors.textSecondary),
+            ),
+          ),
+          const SizedBox(height: 10),
+          OmiButton.secondary(
+            label: context.l10n.appReEnable,
+            size: OmiButtonSize.compact,
+            isLoading: _reEnabling,
+            onPressed: _reEnabling ? null : _reEnableApp,
+          ),
+        ],
+      ],
+    );
+  }
+
+  Future<void> _reEnableApp() async {
+    setState(() => _reEnabling = true);
+    final (ok, detail) = await reEnableAppServer(app.id);
+    if (!mounted) return;
+    setState(() => _reEnabling = false);
+
+    if (ok) {
+      setState(() {
+        app.disabled = false;
+        app.disabledReason = null;
+        app.disabledAt = null;
+        app.disabledError = null;
+      });
+      context.read<AppProvider>().getApps();
+      return;
+    }
+
+    // The rejection names the URL to fix, so it is shown verbatim rather than
+    // replaced with a generic retry prompt.
+    showOmiAlert(
+      context,
+      title: context.l10n.appReEnableFailedTitle,
+      message: detail.isNotEmpty ? detail : context.l10n.appReEnableFailedBody,
+    );
+  }
+
+  Future<void> _navigateToSetup() async {
+    final authSteps = app.externalIntegration?.authSteps ?? const [];
+    if (app.worksExternally() && authSteps.isNotEmpty) {
+      final uri = Uri.tryParse(appSetupUrlWithUid(authSteps.first.url, SharedPreferencesUtil().uid));
+      if (uri == null) {
+        if (mounted) OmiFeedback.error(context, context.l10n.invalidIntegrationUrl);
+        return;
+      }
+      await _launchUrlSafely(uri);
+    } else {
+      await _openSetupInstructions();
+    }
+    _startSetupCompletionCheck();
+  }
+
+  /// Opens an integration's setup instructions: rendered markdown, an external link, or inline text.
+  Future<void> _openSetupInstructions() async {
+    final integration = app.externalIntegration;
+    final path = integration?.setupInstructionsFilePath;
+    if (integration == null || path == null || path.isEmpty) return;
+    final title = context.l10n.setupInstructions;
+    if (path.contains('raw.githubusercontent.com')) {
+      await routeToPage(context, MarkdownViewer(title: title, markdown: instructionsMarkdown ?? ''));
+    } else if (integration.isInstructionsUrl == true) {
+      final uri = Uri.tryParse(path);
+      if (uri == null) {
+        OmiFeedback.error(context, context.l10n.invalidSetupInstructionsUrl);
+        return;
+      }
+      await _launchUrlSafely(uri);
+    } else {
+      await routeToPage(context, MarkdownViewer(title: title, markdown: path));
+    }
+  }
+
+  void _startSetupCompletionCheck() {
+    // Cancel any existing timer
+    _setupCheckTimer?.cancel();
+
+    _setupCheckTimer = Timer.periodic(const Duration(seconds: 3), (timer) {
+      if (!mounted) {
+        timer.cancel();
         return;
       }
 
-      prefs.enableApp(appId);
-      MixpanelManager().appEnabled(appId);
+      checkSetupCompleted();
 
-      // Automatically open app home page after installation if available
-      if (app.externalIntegration?.appHomeUrl?.isNotEmpty == true) {
-        Future.delayed(const Duration(seconds: 1), () {
-          if (mounted) {
-            Navigator.push(
-              context,
-              MaterialPageRoute(
-                builder: (context) => AppHomeWebPage(app: app),
-              ),
-            );
-          }
-        });
+      // Stop checking after 5 minutes
+      if (timer.tick > 100) {
+        timer.cancel();
       }
-    } else {
-      prefs.disableApp(appId);
-      var res = await disableAppServer(appId);
-      print(res);
-      MixpanelManager().appDisabled(appId);
-    }
-    context.read<AppProvider>().setApps();
-    setState(() => app.enabled = isEnabled);
-    setState(() => appLoading = false);
+
+      // Stop checking if app becomes enabled
+      if (app.enabled) {
+        timer.cancel();
+      }
+    });
   }
-}
 
-class RecentReviewsSection extends StatelessWidget {
-  final List<AppReview> reviews;
-  final String appAuthor;
-  const RecentReviewsSection({super.key, required this.reviews, required this.appAuthor});
+  Future<void> _enableApp(String appId) async {
+    var prefs = SharedPreferencesUtil();
+    setState(() => appLoading = true);
 
-  @override
-  Widget build(BuildContext context) {
-    if (reviews.isEmpty) {
-      return const SizedBox.shrink();
+    bool enabled;
+    String detail;
+    try {
+      (enabled, detail) = await widget.enableApp(appId);
+    } catch (_) {
+      if (!mounted) return;
+      showOmiAlert(context, title: context.l10n.errorActivatingApp, message: context.l10n.issueActivatingApp);
+      setState(() => appLoading = false);
+      return;
     }
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        const SizedBox(height: 12),
-        const Text(
-          'Most Recent Reviews',
-          style: TextStyle(color: Colors.white, fontSize: 16),
-        ),
-        const SizedBox(height: 16),
-        ConstrainedBox(
-          constraints: BoxConstraints(
-            maxHeight: reviews.any((e) => e.response.isNotEmpty)
-                ? MediaQuery.of(context).size.height * 0.24
-                : (MediaQuery.of(context).size.height < 680
-                    ? MediaQuery.of(context).size.height * 0.2
-                    : MediaQuery.of(context).size.height * 0.138),
-          ),
-          child: ListView.separated(
-            scrollDirection: Axis.horizontal,
-            shrinkWrap: true,
-            itemCount: reviews.length,
-            itemBuilder: (context, index) {
-              return Container(
-                width: reviews.length == 1
-                    ? MediaQuery.of(context).size.width * 0.84
-                    : MediaQuery.of(context).size.width * 0.78,
-                padding: const EdgeInsets.all(16.0),
-                margin: const EdgeInsets.only(left: 8.0, right: 8.0, top: 0, bottom: 6),
-                decoration: BoxDecoration(
-                  color: const Color.fromARGB(255, 25, 24, 24),
-                  borderRadius: BorderRadius.circular(16.0),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Row(
-                      children: [
-                        RatingBar.builder(
-                          initialRating: reviews[index].score.toDouble(),
-                          minRating: 1,
-                          ignoreGestures: true,
-                          direction: Axis.horizontal,
-                          allowHalfRating: true,
-                          itemCount: 5,
-                          itemSize: 20,
-                          tapOnlyMode: false,
-                          itemPadding: const EdgeInsets.symmetric(horizontal: 0),
-                          itemBuilder: (context, _) => const Icon(Icons.star, color: Colors.deepPurple),
-                          maxRating: 5.0,
-                          onRatingUpdate: (rating) {},
-                        ),
-                        const SizedBox(
-                          width: 8,
-                        ),
-                        Text(
-                          timeago.format(reviews[index].ratedAt),
-                          style: const TextStyle(color: Color.fromARGB(255, 176, 174, 174), fontSize: 12),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(
-                      height: 8,
-                    ),
-                    Text(
-                      reviews[index].review.length > 100
-                          ? '${reviews[index].review.characters.take(100).toString().decodeString.trim()}...'
-                          : reviews[index].review.decodeString,
-                      style: const TextStyle(
-                        color: Colors.white,
-                      ),
-                    ),
-                    const SizedBox(
-                      height: 6,
-                    ),
-                    reviews[index].response.isNotEmpty
-                        ? Column(
-                            mainAxisSize: MainAxisSize.min,
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const Divider(
-                                color: Color.fromARGB(255, 92, 92, 92),
-                              ),
-                              const SizedBox(height: 6),
-                              Row(
-                                children: [
-                                  Text(
-                                    'Response from $appAuthor',
-                                    style: const TextStyle(color: Colors.white, fontSize: 14),
-                                  ),
-                                  const SizedBox(
-                                    width: 8,
-                                  ),
-                                  Text(
-                                    timeago.format(reviews[index].ratedAt),
-                                    style: const TextStyle(color: Color.fromARGB(255, 176, 174, 174), fontSize: 12),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(
-                                height: 8,
-                              ),
-                              Text(
-                                reviews[index].response.length > 100
-                                    ? '${reviews[index].response.characters.take(100).toString().decodeString.trim()}...'
-                                    : reviews[index].response.decodeString,
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                ),
-                              ),
-                            ],
-                          )
-                        : const SizedBox.shrink(),
-                  ],
-                ),
-              );
-            },
-            separatorBuilder: (context, index) => const SizedBox(width: 2),
-          ),
-        ),
-      ],
+
+    if (!mounted) {
+      appLoading = false;
+      return;
+    }
+
+    if (!enabled) {
+      // Setup is only the right guess when the backend gave no reason. A
+      // disabled app used to land here and get sent to setup instructions,
+      // so the developer re-ran a setup that was never the problem.
+      if (app.worksExternally() && detail.isEmpty) {
+        setState(() => appLoading = false);
+        await _navigateToSetup();
+        return;
+      } else {
+        showOmiAlert(
+          context,
+          title: context.l10n.errorActivatingApp,
+          message: detail.isNotEmpty ? detail : context.l10n.issueActivatingApp,
+        );
+        setState(() => appLoading = false);
+        return;
+      }
+    }
+
+    prefs.enableApp(appId);
+    PlatformManager.instance.analytics.appEnabled(appId);
+    context.read<AppProvider>().filterApps();
+
+    setState(() {
+      app.enabled = true;
+      appLoading = false;
+    });
+    if (app.worksExternally()) {
+      checkSetupCompleted();
+    }
+
+    // Automatically open app home page after installation if available
+    if (app.externalIntegration?.appHomeUrl?.isNotEmpty == true) {
+      Future.delayed(const Duration(seconds: 1), () {
+        if (mounted) {
+          routeToPage(context, AppHomeWebPage(app: app));
+        }
+      });
+    }
+  }
+
+  /// Disable is immediate with a 5 s Undo (docs/ux-contract.md §4); re-enabling needs no setup.
+  Future<void> _disableApp() async {
+    await disableAppWithUndo(
+      context,
+      app,
+      onHidden: () => setState(() => app.enabled = false),
+      onRestored: () {
+        if (mounted) setState(() => app.enabled = true);
+      },
+    );
+  }
+
+  /// Enable (after the data-access question for external apps), Subscribe, or Disable.
+  Widget _buildPrimaryAction(AppLocalizations l10n) {
+    if (isLoading) {
+      return OmiButton(label: l10n.enable, size: OmiButtonSize.compact, isLoading: true, onPressed: null);
+    }
+    // Handlers return nothing to the button on purpose: it spins for [appLoading] (the server
+    // call), not while a question or an Undo toast is up.
+    if (app.enabled) {
+      return OmiButton.secondary(
+        label: l10n.disable,
+        size: OmiButtonSize.compact,
+        onPressed: () {
+          _disableApp();
+        },
+      );
+    }
+    if (app.isPaid && !app.isUserPaid) {
+      return OmiButton(
+        label: l10n.subscribe,
+        size: OmiButtonSize.compact,
+        isLoading: appLoading,
+        onPressed: () {
+          _subscribe();
+        },
+      );
+    }
+    return OmiButton(
+      label: l10n.enable,
+      size: OmiButtonSize.compact,
+      isLoading: appLoading,
+      onPressed: () {
+        _enableWithConsent();
+      },
+    );
+  }
+
+  Future<void> _enableWithConsent() async {
+    if (!await confirmAppDataAccess(context, app)) return;
+    if (mounted) await _enableApp(app.id);
+  }
+
+  Future<void> _subscribe() async {
+    PlatformManager.instance.analytics.appDetailSubscribeClicked(appId: app.id, appName: app.name);
+    final link = app.paymentLink;
+    if (link == null || link.isEmpty) {
+      OmiFeedback.error(context, context.l10n.invalidPaymentUrl);
+      return;
+    }
+    final uri = Uri.tryParse(link);
+    if (uri == null) {
+      OmiFeedback.error(context, context.l10n.invalidPaymentUrl);
+      return;
+    }
+    _checkPaymentStatus(app.id);
+    await _launchUrlSafely(uri);
+  }
+
+  Future<void> _confirmCancelSubscription() async {
+    final l10n = context.l10n;
+    final confirmed = await showOmiConfirm(
+      context,
+      title: l10n.cancelSubscriptionQuestion,
+      message: l10n.cancelSubscriptionKeepAccessMessage,
+      confirmLabel: l10n.cancelSubscriptionButton,
+      cancelLabel: l10n.keepSubscription,
+      destructive: true,
+    );
+    if (confirmed) await _cancelSubscription();
+  }
+
+  Future<void> _openChatWithApp() async {
+    setState(() => chatButtonLoading = true);
+    try {
+      final appProvider = context.read<AppProvider>();
+      final messageProvider = context.read<MessageProvider>();
+      appProvider.setSelectedChatAppId(app.id);
+      await messageProvider.refreshMessages();
+      final selectedApp = await appProvider.getAppFromId(app.id);
+      if (messageProvider.messages.isEmpty) {
+        messageProvider.sendInitialAppMessage(selectedApp);
+      }
+      PlatformManager.instance.analytics.appDetailChatClicked(appId: app.id, appName: app.name);
+      if (mounted) await openChatSheet(context, const ChatPage(isPivotBottom: false));
+    } finally {
+      if (mounted) setState(() => chatButtonLoading = false);
+    }
+  }
+
+  Future<void> _shareApp(BuildContext buttonContext) async {
+    final sid = newShareId();
+    // iPad needs the share button's position for the popover.
+    final box = buttonContext.findRenderObject() as RenderBox?;
+    final origin = box != null ? box.localToGlobal(Offset.zero) & box.size : null;
+    final outcome = await SharePlus.instance.share(
+      ShareParams(
+        text: appShareUrl(app.id, sid: sid),
+        subject: app.name,
+        sharePositionOrigin: origin,
+      ),
+    );
+    final targetApp = outcome.status == ShareResultStatus.success ? shareTargetApp(outcome.raw) : null;
+    PlatformManager.instance.analytics.track(
+      'App Shared',
+      properties: {
+        'appId': app.id,
+        'share_id': sid,
+        'share_status': outcome.status.name,
+        if (targetApp != null) 'target_app': targetApp,
+      },
+    );
+    PlatformManager.instance.analytics.track(
+      'App Detail Shared',
+      properties: {
+        'app_id': app.id,
+        'app_name': app.name,
+        'share_id': sid,
+        if (targetApp != null) 'target_app': targetApp,
+      },
     );
   }
 }

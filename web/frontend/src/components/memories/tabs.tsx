@@ -3,27 +3,43 @@
 interface TabsProps {
   currentTab: string;
   setCurrentTab: (tab: string) => void;
+  onNewChat?: () => void;
+  showNewChat?: boolean;
 }
 
-export default function Tabs({ currentTab, setCurrentTab }: TabsProps) {
+const TABS = [
+  { id: 'sum', label: 'Notes' },
+  { id: 'trs', label: 'Transcript' },
+  { id: 'chat', label: 'Ask Omi' },
+];
+
+export default function Tabs({
+  currentTab,
+  setCurrentTab,
+  onNewChat,
+  showNewChat,
+}: TabsProps) {
   return (
-    <div className="mt-8 flex border-y border-solid border-zinc-800 text-base md:mt-10 md:text-lg">
-      <button
-        onClick={() => setCurrentTab('trs')}
-        className={`${
-          currentTab === 'trs' ? 'bg-zinc-800' : 'hover:bg-zinc-900'
-        } w-full py-3 text-center transition-colors`}
-      >
-        Transcript
-      </button>
-      <button
-        onClick={() => setCurrentTab('sum')}
-        className={`${
-          currentTab === 'sum' ? 'bg-zinc-800' : 'hover:bg-zinc-900'
-        } w-full py-3 text-center transition-colors`}
-      >
-        Summary
-      </button>
+    <div className="sn-tabs">
+      <div className="sn-tabs-list" role="tablist" aria-label="Note views">
+        {TABS.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            role="tab"
+            aria-selected={currentTab === tab.id}
+            onClick={() => setCurrentTab(tab.id)}
+            className={`sn-tab${currentTab === tab.id ? ' sn-tab-active' : ''}`}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+      {showNewChat && currentTab === 'chat' && onNewChat && (
+        <button type="button" onClick={onNewChat} className="sn-newchat">
+          New chat
+        </button>
+      )}
     </div>
   );
 }

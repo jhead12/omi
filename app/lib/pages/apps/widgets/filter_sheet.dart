@@ -1,257 +1,327 @@
+import 'package:omi/utils/platform/platform_manager.dart';
 import 'package:flutter/material.dart';
-import 'package:omi/providers/app_provider.dart';
-import 'package:omi/utils/analytics/mixpanel.dart';
+
 import 'package:provider/provider.dart';
 
+import 'package:omi/l10n/app_localizations.dart';
+import 'package:omi/providers/app_provider.dart';
+import 'package:omi/ui/ui.dart';
+import 'package:omi/utils/app_localizations_helper.dart';
+
+/// The app store's filter sheet: authorship, rating, category, sort and capability filters, with
+/// Reset and Apply at the bottom.
+///
+/// Present it with [FilterBottomSheet.show]; the sheet shell owns the handle, title and close X.
 class FilterBottomSheet extends StatelessWidget {
   const FilterBottomSheet({super.key});
 
+  static Future<void> show(BuildContext context) {
+    return showOmiSheet<void>(
+      context: context,
+      title: AppLocalizations.of(context).filters,
+      padding: EdgeInsets.zero,
+      builder: (context) => const FilterBottomSheet(),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    return DraggableScrollableSheet(
-      expand: false,
-      maxChildSize: 0.8,
-      initialChildSize: 0.6,
-      minChildSize: 0.4,
-      builder: (context, scrollController) {
-        return Consumer<AppProvider>(builder: (context, provider, child) {
-          return Scaffold(
-            body: SingleChildScrollView(
-              controller: scrollController,
-              child: Padding(
-                padding: const EdgeInsets.all(16.0),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        const Text(
-                          'Filters',
-                          style: TextStyle(
-                            fontSize: 24,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                        IconButton(
-                          icon: const Icon(Icons.close),
-                          onPressed: () {
-                            provider.filterApps();
-                            Navigator.of(context).pop();
-                          },
-                        ),
+    return SizedBox(
+      height: MediaQuery.sizeOf(context).height * 0.75,
+      child: Consumer<AppProvider>(
+        builder: (context, provider, child) {
+          return Column(
+            children: [
+              // Content
+              Expanded(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.fromLTRB(OmiSpacing.lg, OmiSpacing.xs, OmiSpacing.lg, OmiSpacing.xl),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      // Apps
+                      _buildSectionTitle(AppLocalizations.of(context).apps),
+                      const SizedBox(height: OmiSpacing.xs),
+                      _buildAuthorshipChip(context, provider),
+
+                      const SizedBox(height: OmiSpacing.xl),
+
+                      // Rating
+                      _buildSectionTitle(AppLocalizations.of(context).rating),
+                      const SizedBox(height: OmiSpacing.sm),
+                      _buildRatingSelector(provider),
+
+                      const SizedBox(height: OmiSpacing.xl),
+
+                      // Categories (hidden while the catalog offers none)
+                      if (provider.categories.isNotEmpty) ...[
+                        _buildSectionTitle(AppLocalizations.of(context).categories),
+                        const SizedBox(height: OmiSpacing.xs),
+                        _buildCategoryChips(context, provider),
+                        const SizedBox(height: OmiSpacing.xl),
                       ],
-                    ),
-                    const SizedBox(height: 16),
-                    FilterSection(
-                      title: 'Apps',
-                      child: Column(
-                        children: [
-                          FilterOption(
-                            label: 'Installed Apps',
-                            onTap: () {
-                              provider.addOrRemoveFilter('Installed Apps', 'Apps');
-                              MixpanelManager().appsTypeFilter(
-                                  'Installed Apps', provider.isFilterSelected('Installed Apps', 'Apps'));
-                            },
-                            isSelected: provider.isFilterSelected('Installed Apps', 'Apps'),
-                          ),
-                          FilterOption(
-                            label: 'My Apps',
-                            onTap: () {
-                              provider.addOrRemoveFilter('My Apps', 'Apps');
-                              MixpanelManager().appsTypeFilter('My Apps', provider.isFilterSelected('My Apps', 'Apps'));
-                            },
-                            isSelected: provider.isFilterSelected('My Apps', 'Apps'),
-                          ),
-                        ],
+
+                      // Sort Options
+                      _buildSectionTitle(AppLocalizations.of(context).sortBy),
+                      const SizedBox(height: OmiSpacing.sm),
+                      _buildSortOptions(context, provider),
+
+                      // Capabilities (hidden while the catalog offers none)
+                      if (provider.capabilities.isNotEmpty) ...[
+                        const SizedBox(height: OmiSpacing.xl),
+                        _buildSectionTitle(AppLocalizations.of(context).capabilities),
+                        const SizedBox(height: OmiSpacing.xs),
+                        _buildCapabilities(context, provider),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+
+              // Bottom buttons
+              Container(
+                padding: const EdgeInsets.fromLTRB(OmiSpacing.lg, OmiSpacing.md, OmiSpacing.lg, OmiSpacing.xs),
+                decoration: BoxDecoration(
+                  border: Border(top: BorderSide(color: OmiColors.border, width: 1)),
+                ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: OmiButton.secondary(
+                        key: const ValueKey('filter_sheet_reset_button'),
+                        label: AppLocalizations.of(context).resetFilters,
+                        expand: true,
+                        onPressed: () {
+                          provider.clearFilters();
+                          PlatformManager.instance.analytics.appsClearFilters();
+                          Navigator.of(context).pop();
+                          Future.microtask(() => provider.applyFilters());
+                        },
                       ),
                     ),
-                    FilterSection(
-                      title: 'Sort',
-                      child: Column(
-                        children: [
-                          FilterOption(
-                            label: 'A-Z',
-                            onTap: () {
-                              provider.addOrRemoveFilter('A-Z', 'Sort');
-                              MixpanelManager().appsSortFilter('A-Z', provider.isFilterSelected('A-Z', 'Sort'));
-                            },
-                            isSelected: provider.isFilterSelected('A-Z', 'Sort'),
-                          ),
-                          FilterOption(
-                            label: 'Z-A',
-                            onTap: () {
-                              provider.addOrRemoveFilter('Z-A', 'Sort');
-                              MixpanelManager().appsSortFilter('Z-A', provider.isFilterSelected('Z-A', 'Sort'));
-                            },
-                            isSelected: provider.isFilterSelected('Z-A', 'Sort'),
-                          ),
-                          FilterOption(
-                            label: 'Highest Rating',
-                            onTap: () {
-                              provider.addOrRemoveFilter('Highest Rating', 'Sort');
-                              MixpanelManager().appsSortFilter(
-                                  'Highest Rating', provider.isFilterSelected('Highest Rating', 'Sort'));
-                            },
-                            isSelected: provider.isFilterSelected('Highest Rating', 'Sort'),
-                          ),
-                          FilterOption(
-                            label: 'Lowest Rating',
-                            onTap: () {
-                              provider.addOrRemoveFilter('Lowest Rating', 'Sort');
-                              MixpanelManager()
-                                  .appsSortFilter('Lowest Rating', provider.isFilterSelected('Lowest Rating', 'Sort'));
-                            },
-                            isSelected: provider.isFilterSelected('Lowest Rating', 'Sort'),
-                          ),
-                        ],
+                    const SizedBox(width: OmiSpacing.md),
+                    Expanded(
+                      child: OmiButton(
+                        key: const ValueKey('filter_sheet_apply_button'),
+                        label: AppLocalizations.of(context).applyFilters,
+                        expand: true,
+                        onPressed: () {
+                          Navigator.of(context).pop();
+                          Future.microtask(() => provider.applyFilters());
+                        },
                       ),
                     ),
-                    FilterSection(
-                      title: 'Category',
-                      child: Column(
-                        children: provider.categories
-                            .map((category) => FilterOption(
-                                  label: category.title,
-                                  onTap: () {
-                                    provider.addOrRemoveCategoryFilter(category);
-                                    MixpanelManager().appsCategoryFilter(
-                                        category.title, provider.isCategoryFilterSelected(category));
-                                  },
-                                  isSelected: provider.isCategoryFilterSelected(category),
-                                ))
-                            .toList(),
-                      ),
-                    ),
-                    FilterSection(
-                      title: 'Rating',
-                      child: Column(
-                        children: [
-                          FilterOption(
-                              label: '1+ Stars',
-                              onTap: () {
-                                provider.addOrRemoveFilter('1+ Stars', 'Rating');
-                                MixpanelManager()
-                                    .appsRatingFilter('1+ Stars', provider.isFilterSelected('1+ Stars', 'Rating'));
-                              },
-                              isSelected: provider.isFilterSelected('1+ Stars', 'Rating')),
-                          FilterOption(
-                              label: '2+ Stars',
-                              onTap: () {
-                                provider.addOrRemoveFilter('2+ Stars', 'Rating');
-                                MixpanelManager()
-                                    .appsRatingFilter('2+ Stars', provider.isFilterSelected('2+ Stars', 'Rating'));
-                              },
-                              isSelected: provider.isFilterSelected('2+ Stars', 'Rating')),
-                          FilterOption(
-                              label: '3+ Stars',
-                              onTap: () {
-                                provider.addOrRemoveFilter('3+ Stars', 'Rating');
-                                MixpanelManager()
-                                    .appsRatingFilter('3+ Stars', provider.isFilterSelected('3+ Stars', 'Rating'));
-                              },
-                              isSelected: provider.isFilterSelected('3+ Stars', 'Rating')),
-                          FilterOption(
-                              label: '4+ Stars',
-                              onTap: () {
-                                provider.addOrRemoveFilter('4+ Stars', 'Rating');
-                                MixpanelManager()
-                                    .appsRatingFilter('4+ Stars', provider.isFilterSelected('4+ Stars', 'Rating'));
-                              },
-                              isSelected: provider.isFilterSelected('4+ Stars', 'Rating')),
-                        ],
-                      ),
-                    ),
-                    FilterSection(
-                      title: 'Capabilities',
-                      child: Column(
-                        children: provider.capabilities
-                            .map((capability) => FilterOption(
-                                  label: capability.title,
-                                  onTap: () {
-                                    provider.addOrRemoveCapabilityFilter(capability);
-                                    MixpanelManager().appsCapabilityFilter(
-                                        capability.title, provider.isCapabilityFilterSelected(capability));
-                                  },
-                                  isSelected: provider.isCapabilityFilterSelected(capability),
-                                ))
-                            .toList(),
-                      ),
-                    ),
-                    const SizedBox(height: 20),
                   ],
                 ),
               ),
-            ),
-            bottomNavigationBar: Padding(
-              padding: const EdgeInsets.fromLTRB(40, 10, 40, 40),
-              child: ElevatedButton(
-                onPressed: () {
-                  provider.clearFilters();
-                  MixpanelManager().appsClearFilters();
-                },
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.grey[300],
-                  padding: const EdgeInsets.symmetric(horizontal: 32),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(20),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildSectionTitle(String title) {
+    return Text(title, style: OmiType.headline);
+  }
+
+  Widget _buildRatingSelector(AppProvider provider) {
+    final ratings = ['1', '2', '3', '4', '5'];
+
+    return Row(
+      children: ratings.map((rating) {
+        final filterKey = '$rating+ Stars';
+        final isSelected = provider.isFilterSelected(filterKey, 'Rating');
+
+        return Expanded(
+          child: GestureDetector(
+            onTap: () {
+              provider.addOrRemoveFilter(filterKey, 'Rating');
+              PlatformManager.instance.analytics.appsRatingFilter(
+                filterKey,
+                provider.isFilterSelected(filterKey, 'Rating'),
+              );
+            },
+            child: Container(
+              margin: const EdgeInsets.only(right: OmiSpacing.xs),
+              padding: const EdgeInsets.symmetric(vertical: OmiSpacing.sm),
+              decoration: BoxDecoration(
+                color: isSelected ? OmiColors.textPrimary.withValues(alpha: 0.22) : OmiColors.surface2,
+                borderRadius: OmiRadius.smAll,
+              ),
+              child: Center(
+                child: Text(
+                  '$rating+',
+                  style: OmiType.callout.copyWith(
+                    fontWeight: FontWeight.w600,
+                    color: isSelected ? OmiColors.textPrimary : OmiColors.textSecondary,
                   ),
                 ),
-                child: const Text('Clear Filters'),
               ),
             ),
-          );
-        });
-      },
+          ),
+        );
+      }).toList(),
     );
   }
-}
 
-class FilterSection extends StatelessWidget {
-  final String title;
-  final Widget? child;
+  Widget _buildAuthorshipChip(BuildContext context, AppProvider provider) {
+    final isSelected = provider.isFilterSelected('My Apps', 'Apps');
 
-  const FilterSection({super.key, required this.title, this.child});
-
-  @override
-  Widget build(BuildContext context) {
-    return ExpansionTile(
-      iconColor: Colors.white,
-      title: Text(
-        title,
-        style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w500, color: Colors.white),
-      ),
-      children: [if (child != null) child!],
-    );
-  }
-}
-
-class FilterOption extends StatelessWidget {
-  final String label;
-  final Function()? onTap;
-  final bool isSelected;
-
-  const FilterOption({super.key, required this.label, this.onTap, this.isSelected = false});
-
-  @override
-  Widget build(BuildContext context) {
-    return ListTile(
-      leading: SizedBox(
-        height: 22.0,
-        width: 22.0,
-        child: Checkbox(
-          shape: const CircleBorder(),
-          value: isSelected,
-          onChanged: (value) {
-            if (onTap != null) {
-              onTap!();
-            }
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        GestureDetector(
+          onTap: () {
+            provider.addOrRemoveFilter('My Apps', 'Apps');
+            provider.applyFilters();
+            PlatformManager.instance.analytics.appsTypeFilter('My Apps', !isSelected);
           },
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: OmiSpacing.sm, vertical: OmiSpacing.xxs),
+            decoration: BoxDecoration(
+              color: isSelected ? OmiColors.textPrimary.withValues(alpha: 0.22) : OmiColors.surface2,
+              borderRadius: OmiRadius.pillAll,
+            ),
+            child: Text(
+              AppLocalizations.of(context).myApps,
+              style: OmiType.footnote.copyWith(
+                fontWeight: FontWeight.w500,
+                color: isSelected ? OmiColors.textPrimary : OmiColors.textSecondary,
+              ),
+            ),
+          ),
         ),
-      ),
-      title: Text(label),
-      onTap: onTap,
+      ],
+    );
+  }
+
+  Widget _buildCategoryChips(BuildContext context, AppProvider provider) {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: provider.categories.map((category) {
+        final isSelected = provider.isCategoryFilterSelected(category);
+
+        return GestureDetector(
+          onTap: () {
+            provider.addOrRemoveCategoryFilter(category);
+            PlatformManager.instance.analytics.appsCategoryFilter(
+              category.title,
+              provider.isCategoryFilterSelected(category),
+            );
+          },
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: OmiSpacing.sm, vertical: OmiSpacing.xxs),
+            decoration: BoxDecoration(
+              color: isSelected ? OmiColors.textPrimary.withValues(alpha: 0.22) : OmiColors.surface2,
+              borderRadius: OmiRadius.pillAll,
+            ),
+            child: Text(
+              category.getLocalizedTitle(context),
+              style: OmiType.footnote.copyWith(
+                fontWeight: FontWeight.w500,
+                color: isSelected ? OmiColors.textPrimary : OmiColors.textSecondary,
+              ),
+            ),
+          ),
+        );
+      }).toList(),
+    );
+  }
+
+  Widget _buildSortOptions(BuildContext context, AppProvider provider) {
+    final l10n = AppLocalizations.of(context);
+    final sortOptions = [
+      {'label': 'A-Z', 'key': 'A-Z'},
+      {'label': 'Z-A', 'key': 'Z-A'},
+      {'label': l10n.highestRating, 'key': 'Highest Rating'},
+      {'label': l10n.lowestRating, 'key': 'Lowest Rating'},
+      {'label': l10n.mostInstalls, 'key': 'Most Installs'},
+    ];
+
+    return Column(
+      children: sortOptions.map((option) {
+        final isSelected = provider.isFilterSelected(option['key']!, 'Sort');
+
+        return Container(
+          margin: const EdgeInsets.only(bottom: OmiSpacing.xs),
+          child: GestureDetector(
+            onTap: () {
+              provider.addOrRemoveFilter(option['key']!, 'Sort');
+              PlatformManager.instance.analytics.appsSortFilter(
+                option['key']!,
+                provider.isFilterSelected(option['key']!, 'Sort'),
+              );
+            },
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: OmiSpacing.md, vertical: OmiSpacing.sm),
+              decoration: BoxDecoration(
+                color: OmiColors.surface1.withValues(alpha: 0.5),
+                borderRadius: OmiRadius.mdAll,
+                border: isSelected ? Border.all(color: OmiColors.textPrimary, width: 2) : null,
+              ),
+              child: Row(
+                children: [
+                  Container(
+                    width: 20,
+                    height: 20,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: isSelected ? OmiColors.textPrimary : Colors.transparent,
+                      border: Border.all(color: isSelected ? OmiColors.textPrimary : OmiColors.textTertiary, width: 2),
+                    ),
+                    child: isSelected ? Icon(Icons.check, size: 12, color: OmiColors.onAccent) : null,
+                  ),
+                  const SizedBox(width: OmiSpacing.sm),
+                  Text(
+                    option['label']!,
+                    style: OmiType.callout.copyWith(
+                      color: isSelected ? OmiColors.textPrimary : OmiColors.textSecondary,
+                      fontWeight: isSelected ? FontWeight.w500 : FontWeight.normal,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      }).toList(),
+    );
+  }
+
+  Widget _buildCapabilities(BuildContext context, AppProvider provider) {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: provider.capabilities.map((capability) {
+        final isSelected = provider.isCapabilityFilterSelected(capability);
+
+        return GestureDetector(
+          onTap: () {
+            provider.addOrRemoveCapabilityFilter(capability);
+            PlatformManager.instance.analytics.appsCapabilityFilter(
+              capability.title,
+              provider.isCapabilityFilterSelected(capability),
+            );
+          },
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: OmiSpacing.sm, vertical: OmiSpacing.xxs),
+            decoration: BoxDecoration(
+              color: isSelected ? OmiColors.textPrimary.withValues(alpha: 0.22) : OmiColors.surface2,
+              borderRadius: OmiRadius.pillAll,
+            ),
+            child: Text(
+              capability.getLocalizedTitle(context),
+              style: OmiType.footnote.copyWith(
+                fontWeight: FontWeight.w500,
+                color: isSelected ? OmiColors.textPrimary : OmiColors.textSecondary,
+              ),
+            ),
+          ),
+        );
+      }).toList(),
     );
   }
 }

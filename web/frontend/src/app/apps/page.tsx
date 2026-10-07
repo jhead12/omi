@@ -1,7 +1,6 @@
 import AppList from './components/app-list';
 import { Metadata } from 'next';
 import {
-  getBaseMetadata,
   generateProductSchema,
   generateCollectionPageSchema,
   generateOrganizationSchema,
@@ -18,7 +17,7 @@ async function getAppsCount() {
 
 async function getPluginsData() {
   const rawPlugins = await getApprovedApps();
-  const plugins = rawPlugins.map((plugin: any) => {
+  const plugins = rawPlugins.map((plugin: { [key: string]: unknown }) => {
     const { created_at, capabilities, ...rest } = plugin;
     return {
       ...rest,
@@ -32,8 +31,8 @@ async function getPluginsData() {
 
 export async function generateMetadata(): Promise<Metadata> {
   const appsCount = await getAppsCount();
-  const title = 'OMI Apps Marketplace - AI-Powered Apps for Your OMI Necklace';
-  const description = `Discover and install ${appsCount}+ AI-powered apps for your OMI Necklace. Browse apps across productivity, entertainment, health, and more. Transform your OMI experience with voice-controlled applications.`;
+  const title = 'OMI Apps Marketplace - AI-Powered Apps for Your Omi';
+  const description = `Discover and install ${appsCount}+ AI-powered apps for your Omi. Browse apps across productivity, entertainment, health, and more. Transform your OMI experience with voice-controlled applications.`;
 
   return {
     title,

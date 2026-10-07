@@ -1,21 +1,24 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+
+import 'package:omi/backend/preferences.dart';
 import 'package:omi/backend/schema/memory.dart';
-import 'package:omi/providers/connectivity_provider.dart';
 import 'package:omi/providers/memories_provider.dart';
-import 'package:omi/utils/analytics/mixpanel.dart';
-import 'package:provider/provider.dart';
+import 'package:omi/ui/ui.dart';
+import 'package:omi/utils/l10n_extensions.dart';
+import 'package:omi/utils/logger.dart';
+import 'package:omi/utils/platform/platform_manager.dart';
+import 'memory_delete_undo.dart';
+import 'memory_edit_sheet.dart';
 
-import 'delete_confirmation.dart';
-
+/// The new-memory sheet. With [memory] it edits that memory instead (prefer
+/// [showMemoryQuickEditSheet] for existing memories: it also opens read-only ones).
 class MemoryDialog extends StatefulWidget {
   final MemoriesProvider provider;
   final Memory? memory;
 
-  const MemoryDialog({
-    super.key,
-    required this.provider,
-    this.memory,
-  });
+  const MemoryDialog({super.key, required this.provider, this.memory});
 
   @override
   State<MemoryDialog> createState() => _MemoryDialogState();
@@ -23,18 +26,18 @@ class MemoryDialog extends StatefulWidget {
 
 class _MemoryDialogState extends State<MemoryDialog> {
   late TextEditingController contentController;
-  late MemoryCategory selectedCategory;
-  late MemoryVisibility selectedVisibility;
+  bool _isSaving = false;
+  bool _saveFailed = false;
+
+  bool get _isEditing => widget.memory != null;
+
+  bool get _isDirty => contentController.text.trim() != (widget.memory?.content ?? '').trim();
 
   @override
   void initState() {
     super.initState();
     contentController = TextEditingController(text: widget.memory?.content ?? '');
-    contentController.selection = TextSelection.fromPosition(
-      TextPosition(offset: contentController.text.length),
-    );
-    selectedCategory = widget.memory?.category ?? MemoryCategory.values.first;
-    selectedVisibility = widget.memory?.visibility ?? MemoryVisibility.public;
+    contentController.selection = TextSelection.fromPosition(TextPosition(offset: contentController.text.length));
   }
 
   @override
@@ -45,213 +48,157 @@ class _MemoryDialogState extends State<MemoryDialog> {
 
   @override
   Widget build(BuildContext context) {
-    return StatefulBuilder(
-      builder: (context, setState) => Padding(
-        padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
-        child: Container(
-          decoration: BoxDecoration(
-            color: Colors.grey.shade900,
-            borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
+    final l10n = context.l10n;
+    return OmiEditSheet(
+      title: _isEditing ? l10n.editMemoryTitle : l10n.newMemoryTitle,
+      isDirty: _isDirty,
+      enabled: !_isSaving,
+      actions: [
+        if (_isEditing)
+          OmiIconButton(
+            icon: const Icon(Icons.delete_outline),
+            label: l10n.deleteMemory,
+            isDestructive: true,
+            onPressed: _isSaving ? null : _delete,
           ),
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Text(
-                    widget.memory != null ? 'Edit Memory' : 'New Memory',
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 18,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                  IconButton(
-                    icon: Icon(
-                      Icons.close,
-                      color: Colors.grey.shade400,
-                      size: 22,
-                    ),
-                    onPressed: () => Navigator.of(context).pop(),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 16),
-              Container(
-                decoration: BoxDecoration(
-                  color: Colors.grey.shade800,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                child: TextField(
-                  controller: contentController,
-                  textInputAction: TextInputAction.done,
-                  autofocus: true,
-                  maxLines: null,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 16,
-                    height: 1.4,
-                  ),
-                  decoration: const InputDecoration(
-                    hintText: 'I like to eat ice cream...',
-                    hintStyle: TextStyle(color: Colors.grey),
-                    border: InputBorder.none,
-                    contentPadding: EdgeInsets.zero,
-                    isDense: true,
-                  ),
-                  onSubmitted: (value) => _saveMemory(value),
+      ],
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 250),
+              child: TextField(
+                key: const ValueKey('memory_content_field'),
+                controller: contentController,
+                enabled: !_isSaving,
+                onChanged: (_) => setState(() {}),
+                autofocus: true,
+                maxLines: null,
+                minLines: 3,
+                textInputAction: TextInputAction.newline,
+                keyboardType: TextInputType.multiline,
+                style: OmiType.callout.copyWith(height: 1.4),
+                cursorColor: OmiColors.accent,
+                decoration: InputDecoration(
+                  hintText: _isEditing ? null : l10n.memoryContentHint,
+                  hintStyle: OmiType.callout.copyWith(color: OmiColors.textTertiary),
+                  border: InputBorder.none,
+                  contentPadding: EdgeInsets.zero,
+                  isDense: true,
                 ),
               ),
-              if (widget.memory == null || !widget.memory!.manuallyAdded) ...[
-                const SizedBox(height: 20),
-                Text(
-                  'Visibility',
-                  style: TextStyle(
-                    color: Colors.grey.shade400,
-                    fontSize: 14,
+            ),
+            const SizedBox(height: OmiSpacing.lg),
+            if (_saveFailed) ...[
+              Semantics(
+                liveRegion: true,
+                child: Text(
+                  l10n.failedToSaveMemory,
+                  style: OmiType.footnote.copyWith(color: OmiColors.danger),
+                  textAlign: TextAlign.center,
+                ),
+              ),
+              const SizedBox(height: OmiSpacing.xs),
+            ],
+            Row(
+              children: [
+                Expanded(
+                  child: OmiButton.secondary(
+                    label: l10n.cancel,
+                    expand: true,
+                    onPressed: _isSaving ? null : () => Navigator.pop(context),
                   ),
                 ),
-                const SizedBox(height: 8),
-                Row(
-                  children: MemoryVisibility.values.map((visibility) {
-                    final isSelected = visibility == selectedVisibility;
-                    return Padding(
-                      padding: const EdgeInsets.only(right: 8),
-                      child: ChoiceChip(
-                        label: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(
-                              visibility == MemoryVisibility.private ? Icons.lock_outline : Icons.public,
-                              size: 16,
-                              color: isSelected ? Colors.black : Colors.white70,
-                            ),
-                            const SizedBox(width: 4),
-                            Text(
-                              visibility == MemoryVisibility.private ? 'Private' : 'Public',
-                              style: TextStyle(
-                                color: isSelected ? Colors.black : Colors.white70,
-                                fontSize: 13,
-                                fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
-                              ),
-                            ),
-                          ],
-                        ),
-                        selected: isSelected,
-                        showCheckmark: false,
-                        backgroundColor: Colors.grey.shade800,
-                        selectedColor: Colors.white,
-                        onSelected: (bool selected) {
-                          if (selected) {
-                            setState(() => selectedVisibility = visibility);
-                          }
-                        },
-                      ),
-                    );
-                  }).toList(),
+                const SizedBox(width: OmiSpacing.sm),
+                Expanded(
+                  child: OmiButton(
+                    key: const ValueKey('memory_save_button'),
+                    label: _saveFailed ? l10n.tryAgain : l10n.save,
+                    expand: true,
+                    isLoading: _isSaving,
+                    onPressed: contentController.text.trim().isEmpty ? null : _handleSave,
+                  ),
                 ),
               ],
-              const SizedBox(height: 24),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                    decoration: BoxDecoration(
-                      color: Colors.white.withOpacity(0.05),
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          Icons.keyboard_return,
-                          size: 13,
-                          color: Colors.grey.shade400,
-                        ),
-                        const SizedBox(width: 4),
-                        Text(
-                          'Press done to save',
-                          style: TextStyle(
-                            color: Colors.grey.shade400,
-                            fontSize: 11,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  Text(
-                    '${contentController.text.length}/200',
-                    style: TextStyle(
-                      color: Colors.grey.shade500,
-                      fontSize: 11,
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 16),
-              if (widget.memory != null)
-                TextButton.icon(
-                  onPressed: () => _showDeleteConfirmation(context),
-                  icon: const Icon(Icons.delete_outline, color: Colors.red, size: 18),
-                  label: const Text(
-                    'Delete Memory',
-                    style: TextStyle(color: Colors.red),
-                  ),
-                  style: TextButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                  ),
-                ),
-            ],
-          ),
+            ),
+          ],
         ),
       ),
     );
   }
 
-  void _saveMemory(String value) {
-    if (value.trim().isNotEmpty) {
-      if (widget.memory != null) {
-        widget.provider.editMemory(widget.memory!, value);
-        if (widget.memory!.visibility != selectedVisibility) {
-          widget.provider.updateMemoryVisibility(widget.memory!, selectedVisibility);
-        }
-        MixpanelManager().memoriesPageEditedMemory();
-      } else {
-        widget.provider.createMemory(value, selectedVisibility, MemoryCategory.interesting);
-        MixpanelManager().memoriesPageCreatedMemory(MemoryCategory.interesting);
-      }
-      Navigator.pop(context);
-    }
+  void _delete() {
+    final memory = widget.memory;
+    if (memory == null) return;
+    unawaited(deleteMemoryWithUndo(context, widget.provider, memory));
+    Navigator.pop(context);
   }
 
-  Future<void> _showDeleteConfirmation(BuildContext context) async {
-    if (widget.memory == null) return;
+  Future<void> _handleSave() async {
+    if (_isSaving || contentController.text.trim().isEmpty) return;
+    final existingMemory = widget.memory;
+    if (existingMemory != null && !memoryIsEditable(existingMemory)) return;
 
-    final shouldDelete = await DeleteConfirmation.show(context);
-    if (shouldDelete) {
-      widget.provider.deleteMemory(widget.memory!);
-      Navigator.pop(context); // Close edit sheet
+    setState(() {
+      _isSaving = true;
+      _saveFailed = false;
+    });
+
+    final previousIds = widget.provider.memories.map((memory) => memory.id).toSet();
+    bool success;
+
+    try {
+      if (existingMemory != null) {
+        success = await widget.provider.editMemory(existingMemory, contentController.text.trim());
+        if (success) {
+          PlatformManager.instance.analytics.memoriesPageEditedMemory();
+        }
+      } else {
+        success = await widget.provider.createMemory(
+          contentController.text.trim(),
+          MemoryVisibility.private,
+          MemoryCategory.manual,
+        );
+        if (success) {
+          PlatformManager.instance.analytics.memoriesPageCreatedMemory(MemoryCategory.manual);
+        }
+      }
+    } catch (e) {
+      success = false;
+      Logger.debug('Error saving memory: $e');
+    }
+
+    if (!mounted) return;
+
+    setState(() {
+      _isSaving = false;
+      _saveFailed = !success;
+    });
+
+    if (success) {
+      OmiHaptics.light();
+      final waitingToSync = existingMemory == null &&
+          SharedPreferencesUtil().pendingMemories.any((memory) => !previousIds.contains(memory.id));
+      OmiFeedback.confirm(
+        context,
+        waitingToSync ? '${context.l10n.saved} · ${context.l10n.syncStatusWaiting}' : context.l10n.saved,
+      );
+      Navigator.pop(context, true);
     }
   }
 }
 
-// Helper function to show the memory dialog
-Future<void> showMemoryDialog(BuildContext context, MemoriesProvider provider, {Memory? memory}) async {
-  final connectivityProvider = Provider.of<ConnectivityProvider>(context, listen: false);
-  if (!connectivityProvider.isConnected) {
-    ConnectivityProvider.showNoInternetDialog(context);
-    return;
+/// Opens the new-memory sheet, or — with [memory] — that memory (editable or read-only).
+/// Resolves `true` when something was saved.
+Future<bool?> showMemoryDialog(BuildContext context, MemoriesProvider provider, {Memory? memory}) async {
+  if (memory != null) {
+    await showMemoryQuickEditSheet(context, memory, provider);
+    return null;
   }
-
-  return showModalBottomSheet(
+  return showOmiEditSheet<bool>(
     context: context,
-    backgroundColor: Colors.transparent,
-    isScrollControlled: true,
-    builder: (context) => MemoryDialog(provider: provider, memory: memory),
+    builder: (context) => MemoryDialog(provider: provider),
   );
 }

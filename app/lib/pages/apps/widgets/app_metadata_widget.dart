@@ -1,14 +1,20 @@
 import 'dart:io';
 
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
+
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter_svg/svg.dart';
+import 'package:font_awesome_flutter/font_awesome_flutter.dart';
+import 'package:provider/provider.dart';
+import 'package:skeletonizer/skeletonizer.dart';
+
 import 'package:omi/backend/schema/app.dart';
 import 'package:omi/gen/assets.gen.dart';
 import 'package:omi/pages/apps/providers/add_app_provider.dart';
-import 'package:provider/provider.dart';
-import 'package:skeletonizer/skeletonizer.dart';
+import 'package:omi/pages/apps/widgets/app_form_fields.dart';
+import 'package:omi/ui/ui.dart';
+import 'package:omi/utils/app_localizations_helper.dart';
+import 'package:omi/utils/l10n_extensions.dart';
 
 class AppMetadataWidget extends StatelessWidget {
   final File? imageFile;
@@ -37,8 +43,36 @@ class AppMetadataWidget extends StatelessWidget {
     required this.generatingDescription,
   });
 
+  void _pickCategory(BuildContext context) {
+    showAppOptionPicker<String>(
+      context: context,
+      title: context.l10n.appCategoryModalTitle,
+      options: [
+        for (final c in categories) AppFormOption<String>(c.id, c.getLocalizedTitle(context)),
+      ],
+      selected: context.read<AddAppProvider>().appCategory,
+      onSelected: setAppCategory,
+    );
+  }
+
+  void _pickPricing(BuildContext context) {
+    final l10n = context.l10n;
+    showAppOptionPicker<bool>(
+      context: context,
+      title: l10n.appPricingLabel,
+      options: [
+        AppFormOption<bool>(false, l10n.pricingFree),
+        AppFormOption<bool>(true, l10n.pricingPaid),
+      ],
+      selected: context.read<AddAppProvider>().isPaid,
+      onSelected: (isPaid) => context.read<AddAppProvider>().setIsPaid(isPaid),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final l10n = context.l10n;
+    final updateAppId = context.watch<AddAppProvider>().updateAppId;
     return GestureDetector(
       onTap: () {
         FocusScope.of(context).unfocus();
@@ -48,481 +82,193 @@ class AppMetadataWidget extends StatelessWidget {
         onChanged: () {
           Provider.of<AddAppProvider>(context, listen: false).checkValidity();
         },
-        child: Column(
-          children: [
-            Stack(
-              children: [
-                GestureDetector(
-                  onTap: pickImage,
-                  child: Container(
-                    margin: const EdgeInsets.all(8.0),
-                    width: MediaQuery.of(context).size.width * 0.28,
-                    height: MediaQuery.of(context).size.width * 0.28,
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(30.0),
-                      border: Border.all(color: Colors.grey.shade800, width: 2.0),
-                    ),
-                    child: imageFile != null || imageUrl != null
-                        ? (imageUrl == null
-                            ? ClipRRect(
-                                borderRadius: BorderRadius.circular(30.0),
-                                child: Image.file(imageFile!, fit: BoxFit.cover))
-                            : ClipRRect(
-                                borderRadius: BorderRadius.circular(30.0),
-                                child: CachedNetworkImage(imageUrl: imageUrl!),
-                              ))
-                        : const Icon(Icons.add_a_photo, color: Colors.grey, size: 32),
+        child: AppFormCard(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // App ID field with copy button (only shown when updating)
+              if (updateAppId != null) ...[
+                Padding(
+                  padding: const EdgeInsets.only(left: 8.0),
+                  child: AppFormSectionTitle(l10n.appIdLabel),
+                ),
+                Container(
+                  margin: const EdgeInsets.only(left: 2.0, right: 2.0, top: 10, bottom: 6),
+                  padding: const EdgeInsets.symmetric(horizontal: OmiSpacing.sm, vertical: OmiSpacing.xs),
+                  decoration: BoxDecoration(
+                    borderRadius: OmiRadius.mdAll,
+                    border: Border.all(color: OmiColors.border.withValues(alpha: 0.6), width: 1),
+                  ),
+                  width: double.infinity,
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          updateAppId,
+                          style: OmiType.callout.copyWith(color: OmiColors.textSecondary),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      OmiIconButton(
+                        icon: const FaIcon(FontAwesomeIcons.copy, size: 16),
+                        label: l10n.copyToClipboard,
+                        onPressed: () => OmiClipboard.copy(context, updateAppId, what: l10n.appIdLabel),
+                      ),
+                    ],
                   ),
                 ),
-                (imageFile != null || imageUrl != null)
-                    ? Positioned(
-                        bottom: 0,
-                        right: 0,
-                        child: GestureDetector(
-                          onTap: pickImage,
-                          child: Container(
-                            padding: const EdgeInsets.all(8.0),
-                            decoration: BoxDecoration(
-                              color: Colors.grey.shade800,
-                              shape: BoxShape.circle,
-                            ),
-                            child: const Icon(
-                              Icons.edit,
-                              color: Colors.white,
-                            ),
-                          ),
-                        ),
-                      )
-                    : const SizedBox.shrink(),
+                const SizedBox(height: OmiSpacing.xs),
               ],
-            ),
-            const SizedBox(
-              height: 18,
-            ),
-            Container(
-              decoration: BoxDecoration(
-                color: Colors.grey.shade900,
-                borderRadius: BorderRadius.circular(12.0),
-              ),
-              padding: const EdgeInsets.all(14.0),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
+              // Row with Image picker on left, Name and Category on right
+              Row(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const SizedBox(
-                    height: 10,
-                  ),
-                  // App ID field with copy button
-                  context.watch<AddAppProvider>().updateAppId != null
-                      ? Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Padding(
-                              padding: const EdgeInsets.only(left: 8.0),
-                              child: Text(
-                                'App ID',
-                                style: TextStyle(color: Colors.grey.shade300, fontSize: 16),
-                              ),
-                            ),
-                            Container(
-                              margin: const EdgeInsets.only(left: 2.0, right: 2.0, top: 10, bottom: 6),
-                              padding: const EdgeInsets.symmetric(horizontal: 12.0, vertical: 10.0),
-                              decoration: BoxDecoration(
-                                color: Colors.grey.shade800,
-                                borderRadius: BorderRadius.circular(10.0),
-                              ),
-                              width: double.infinity,
-                              child: Row(
-                                children: [
-                                  Expanded(
-                                    child: Text(
-                                      context.watch<AddAppProvider>().updateAppId!,
-                                      style: TextStyle(color: Colors.grey.shade500, fontSize: 16),
-                                      overflow: TextOverflow.ellipsis,
-                                    ),
-                                  ),
-                                  GestureDetector(
-                                    onTap: () {
-                                      Clipboard.setData(
-                                          ClipboardData(text: context.read<AddAppProvider>().updateAppId!));
-                                      ScaffoldMessenger.of(context).showSnackBar(
-                                        const SnackBar(
-                                          content: Text('App ID copied to clipboard'),
-                                          duration: Duration(seconds: 2),
-                                        ),
-                                      );
-                                    },
-                                    child: Container(
-                                      padding: const EdgeInsets.all(6.0),
-                                      decoration: BoxDecoration(
-                                        borderRadius: BorderRadius.circular(8.0),
-                                      ),
-                                      child: Icon(
-                                        Icons.copy,
-                                        color: Colors.white,
-                                        size: 20,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                            const SizedBox(
-                              height: 16,
-                            ),
-                          ],
-                        )
-                      : SizedBox.shrink(),
-                  Padding(
-                    padding: const EdgeInsets.only(left: 8.0),
-                    child: Text(
-                      'App Name',
-                      style: TextStyle(color: Colors.grey.shade300, fontSize: 16),
-                    ),
-                  ),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 12.0, vertical: 6.0),
-                    margin: const EdgeInsets.only(left: 2.0, right: 2.0, top: 10, bottom: 6),
-                    decoration: BoxDecoration(
-                      color: Colors.grey.shade800,
-                      borderRadius: BorderRadius.circular(10.0),
-                    ),
-                    width: double.infinity,
-                    child: TextFormField(
-                      validator: (value) {
-                        if (value == null || value.isEmpty) {
-                          return 'Please enter app name';
-                        }
-                        return null;
-                      },
-                      controller: appNameController,
-                      decoration: const InputDecoration(
-                        errorText: null,
-                        isDense: true,
-                        border: InputBorder.none,
-                        hintText: 'My Awesome App',
-                      ),
-                    ),
-                  ),
-                  const SizedBox(
-                    height: 16,
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.only(left: 8.0),
-                    child: Text(
-                      'Category',
-                      style: TextStyle(color: Colors.grey.shade300, fontSize: 16),
-                    ),
-                  ),
-                  GestureDetector(
-                    onTap: () {
-                      showModalBottomSheet(
-                        context: context,
-                        isScrollControlled: true,
-                        shape: const RoundedRectangleBorder(
-                          borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-                        ),
-                        builder: (context) {
-                          return Consumer<AddAppProvider>(builder: (context, provider, child) {
-                            return Container(
-                              padding: const EdgeInsets.all(16.0),
-                              height: MediaQuery.of(context).size.height * 0.6,
-                              child: SingleChildScrollView(
-                                child: Column(
-                                  mainAxisSize: MainAxisSize.min,
-                                  crossAxisAlignment: CrossAxisAlignment.start,
+                  // Image picker
+                  Stack(
+                    clipBehavior: Clip.none,
+                    children: [
+                      GestureDetector(
+                        onTap: pickImage,
+                        child: Container(
+                          width: 110,
+                          height: 105,
+                          decoration: BoxDecoration(
+                            borderRadius: OmiRadius.lgAll,
+                            border: Border.all(color: OmiColors.surface2, width: 2.0),
+                          ),
+                          child: imageFile != null || imageUrl != null
+                              ? (imageUrl == null
+                                  ? ClipRRect(
+                                      borderRadius: const BorderRadius.all(Radius.circular(14.0)),
+                                      child: Image.file(imageFile!, fit: BoxFit.cover),
+                                    )
+                                  : ClipRRect(
+                                      borderRadius: const BorderRadius.all(Radius.circular(14.0)),
+                                      child: CachedNetworkImage(imageUrl: imageUrl!, fit: BoxFit.cover),
+                                    ))
+                              : Column(
+                                  mainAxisAlignment: MainAxisAlignment.center,
                                   children: [
-                                    const SizedBox(
-                                      height: 12,
-                                    ),
-                                    const Text(
-                                      'App Category',
-                                      style: TextStyle(color: Colors.white, fontSize: 18),
-                                    ),
-                                    const SizedBox(
-                                      height: 18,
-                                    ),
-                                    ListView.separated(
-                                      separatorBuilder: (context, index) {
-                                        return Divider(
-                                          color: Colors.grey.shade600,
-                                          height: 1,
-                                        );
-                                      },
-                                      shrinkWrap: true,
-                                      itemCount: categories.length,
-                                      physics: const NeverScrollableScrollPhysics(),
-                                      itemBuilder: (context, index) {
-                                        return InkWell(
-                                          onTap: () {
-                                            provider.setAppCategory(categories[index].id);
-                                            Navigator.pop(context);
-                                          },
-                                          child: Container(
-                                            padding: const EdgeInsets.symmetric(vertical: 10),
-                                            child: Row(
-                                              crossAxisAlignment: CrossAxisAlignment.center,
-                                              children: [
-                                                const SizedBox(
-                                                  width: 6,
-                                                ),
-                                                Text(
-                                                  categories[index].title,
-                                                  style: TextStyle(color: Colors.grey.shade300, fontSize: 16),
-                                                ),
-                                                const Spacer(),
-                                                Checkbox(
-                                                  value: provider.appCategory == categories[index].id,
-                                                  onChanged: (value) {
-                                                    provider.setAppCategory(categories[index].id);
-                                                    Navigator.pop(context);
-                                                  },
-                                                  side: BorderSide(color: Colors.grey.shade300),
-                                                  shape: const CircleBorder(),
-                                                ),
-                                              ],
-                                            ),
-                                          ),
-                                        );
-                                      },
+                                    FaIcon(FontAwesomeIcons.camera, color: OmiColors.textTertiary, size: 24),
+                                    const SizedBox(height: 6),
+                                    Text(
+                                      '${l10n.appIconLabel}*',
+                                      style: OmiType.caption.copyWith(color: OmiColors.textTertiary),
                                     ),
                                   ],
                                 ),
-                              ),
-                            );
-                          });
-                        },
-                      );
-                    },
-                    child: Container(
-                      margin: const EdgeInsets.only(left: 2.0, right: 2.0, top: 10, bottom: 6),
-                      padding: const EdgeInsets.symmetric(horizontal: 2.0, vertical: 10.0),
-                      decoration: BoxDecoration(
-                        color: Colors.grey.shade800,
-                        borderRadius: BorderRadius.circular(10.0),
+                        ),
                       ),
-                      width: double.infinity,
-                      child: Row(
-                        children: [
-                          const SizedBox(
-                            width: 12,
-                          ),
-                          Text(
-                            (category?.isNotEmpty == true ? category : 'Select Category') ?? 'Select Category',
-                            style: TextStyle(
-                                color: category != null ? Colors.grey.shade100 : Colors.grey.shade400, fontSize: 16),
-                          ),
-                          const Spacer(),
-                          Icon(
-                            Icons.arrow_forward_ios_rounded,
-                            color: Colors.grey.shade400,
-                          ),
-                          const SizedBox(
-                            width: 12,
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                  const SizedBox(
-                    height: 16,
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.only(left: 8.0),
-                    child: Text(
-                      'Description',
-                      style: TextStyle(color: Colors.grey.shade300, fontSize: 16),
-                    ),
-                  ),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 12.0, vertical: 8.0),
-                    margin: const EdgeInsets.only(left: 2.0, right: 2.0, top: 10, bottom: 6),
-                    decoration: BoxDecoration(
-                      color: Colors.grey.shade800,
-                      borderRadius: BorderRadius.circular(10.0),
-                    ),
-                    width: double.infinity,
-                    child: Stack(
-                      children: [
-                        ConstrainedBox(
-                          constraints: BoxConstraints(
-                            minHeight: MediaQuery.sizeOf(context).height * 0.1,
-                            maxHeight: MediaQuery.sizeOf(context).height * 0.4,
-                          ),
-                          child: Scrollbar(
-                            child: SingleChildScrollView(
-                              scrollDirection: Axis.vertical,
-                              reverse: false,
-                              child: generatingDescription
-                                  ? Skeletonizer.zone(
-                                      enabled: generatingDescription,
-                                      effect: ShimmerEffect(
-                                        baseColor: Colors.grey[700]!,
-                                        highlightColor: Colors.grey[600]!,
-                                        duration: Duration(seconds: 1),
-                                      ),
-                                      child: Bone.multiText(),
-                                    )
-                                  : TextFormField(
-                                      maxLines: null,
-                                      validator: (value) {
-                                        if (value == null || value.isEmpty) {
-                                          return 'Please provide a valid description';
-                                        }
-                                        return null;
-                                      },
-                                      controller: appDescriptionController,
-                                      decoration: const InputDecoration(
-                                        contentPadding: EdgeInsets.only(top: 6, bottom: 2),
-                                        isDense: true,
-                                        border: InputBorder.none,
-                                        hintText:
-                                            'My Awesome App is a great app that does amazing things. It is the best app ever!',
-                                        hintMaxLines: 4,
-                                      ),
-                                    ),
-                            ),
+                      if (imageFile != null || imageUrl != null)
+                        Positioned(
+                          bottom: -4,
+                          right: -4,
+                          child: OmiIconButton.filled(
+                            icon: const FaIcon(FontAwesomeIcons.pen, size: 12),
+                            fillColor: OmiColors.surface2,
+                            diameter: 28,
+                            label: l10n.appIconLabel,
+                            onPressed: pickImage,
                           ),
                         ),
-                        appDescriptionController.text.isNotEmpty && appNameController.text.isNotEmpty
-                            ? Positioned(
-                                bottom: 2,
-                                right: 0,
-                                child: GestureDetector(
-                                  onTap: () async {
-                                    await context.read<AddAppProvider>().generateDescription();
-                                  },
-                                  child: SvgPicture.asset(
-                                    Assets.images.aiMagic.path,
-                                    color: Colors.white,
-                                  ),
-                                ),
-                              )
-                            : SizedBox.shrink(),
+                    ],
+                  ),
+                  const SizedBox(width: OmiSpacing.sm + 2),
+                  // Name and Category fields
+                  Expanded(
+                    child: Column(
+                      children: [
+                        // App Name field
+                        TextFormField(
+                          validator: (value) {
+                            if (value == null || value.isEmpty) {
+                              return l10n.pleaseEnterAppName;
+                            }
+                            return null;
+                          },
+                          controller: appNameController,
+                          decoration: appFormInputDecoration(label: '${l10n.appNameLabel}*'),
+                          style: TextStyle(color: OmiColors.textPrimary),
+                        ),
+                        const SizedBox(height: OmiSpacing.xs + 2),
+                        // Category selector
+                        AppFormSelectorField(
+                          value: category,
+                          placeholder: '${l10n.categoryLabel}*',
+                          onTap: () => _pickCategory(context),
+                        ),
                       ],
                     ),
                   ),
-                  const SizedBox(
-                    height: 16,
-                  ),
-                  allowPaidApps
-                      ? Padding(
-                          padding: const EdgeInsets.only(left: 8.0),
-                          child: Text(
-                            'App Pricing',
-                            style: TextStyle(color: Colors.grey.shade300, fontSize: 16),
-                          ),
-                        )
-                      : SizedBox.shrink(),
-                  allowPaidApps
-                      ? GestureDetector(
-                          onTap: () {
-                            showModalBottomSheet(
-                              context: context,
-                              isScrollControlled: true,
-                              shape: const RoundedRectangleBorder(
-                                borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-                              ),
-                              builder: (context) {
-                                return Consumer<AddAppProvider>(builder: (context, provider, child) {
-                                  return Container(
-                                    padding: const EdgeInsets.all(16.0),
-                                    height: MediaQuery.of(context).size.height * 0.36,
-                                    child: SingleChildScrollView(
-                                      child: Column(
-                                        mainAxisSize: MainAxisSize.min,
-                                        crossAxisAlignment: CrossAxisAlignment.start,
-                                        children: [
-                                          const SizedBox(
-                                            height: 12,
-                                          ),
-                                          const Text(
-                                            'App Pricing',
-                                            style: TextStyle(color: Colors.white, fontSize: 18),
-                                          ),
-                                          const SizedBox(
-                                            height: 18,
-                                          ),
-                                          ListView(
-                                            shrinkWrap: true,
-                                            children: ['Free', 'Paid'].map((e) {
-                                              return InkWell(
-                                                onTap: () {
-                                                  provider.setIsPaid(e == 'Paid');
-                                                  Navigator.pop(context);
-                                                },
-                                                child: Container(
-                                                  padding: const EdgeInsets.symmetric(vertical: 10),
-                                                  child: Row(
-                                                    crossAxisAlignment: CrossAxisAlignment.center,
-                                                    children: [
-                                                      const SizedBox(
-                                                        width: 6,
-                                                      ),
-                                                      Text(
-                                                        e,
-                                                        style: TextStyle(color: Colors.grey.shade300, fontSize: 16),
-                                                      ),
-                                                      const Spacer(),
-                                                      Checkbox(
-                                                        value: provider.isPaid == (e == 'Paid'),
-                                                        onChanged: (value) {
-                                                          provider.setIsPaid(e == 'Paid');
-                                                          Navigator.pop(context);
-                                                        },
-                                                        side: BorderSide(color: Colors.grey.shade300),
-                                                        shape: const CircleBorder(),
-                                                      ),
-                                                    ],
-                                                  ),
-                                                ),
-                                              );
-                                            }).toList(),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                  );
-                                });
-                              },
-                            );
-                          },
-                          child: Container(
-                            margin: const EdgeInsets.only(left: 2.0, right: 2.0, top: 10, bottom: 6),
-                            padding: const EdgeInsets.symmetric(horizontal: 2.0, vertical: 10.0),
-                            decoration: BoxDecoration(
-                              color: Colors.grey.shade800,
-                              borderRadius: BorderRadius.circular(10.0),
-                            ),
-                            width: double.infinity,
-                            child: Row(
-                              children: [
-                                const SizedBox(
-                                  width: 12,
-                                ),
-                                Text(
-                                  (appPricing?.isNotEmpty == true ? appPricing : 'None Selected') ?? 'None Selected',
-                                  style: TextStyle(
-                                      color: appPricing != null ? Colors.grey.shade100 : Colors.grey.shade400,
-                                      fontSize: 16),
-                                ),
-                                const Spacer(),
-                                Icon(
-                                  Icons.arrow_forward_ios_rounded,
-                                  color: Colors.grey.shade400,
-                                ),
-                                const SizedBox(
-                                  width: 12,
-                                ),
-                              ],
-                            ),
-                          ),
-                        )
-                      : SizedBox.shrink(),
                 ],
               ),
-            ),
-          ],
+              const SizedBox(height: OmiSpacing.sm + 2),
+              // Description field (full width)
+              Stack(
+                children: [
+                  generatingDescription
+                      ? Container(
+                          padding: const EdgeInsets.all(OmiSpacing.md),
+                          decoration: BoxDecoration(
+                            borderRadius: OmiRadius.mdAll,
+                            border: Border.all(color: OmiColors.border.withValues(alpha: 0.6), width: 1),
+                          ),
+                          constraints: BoxConstraints(minHeight: MediaQuery.sizeOf(context).height * 0.1),
+                          child: Skeletonizer.zone(
+                            enabled: generatingDescription,
+                            effect: ShimmerEffect(
+                              baseColor: OmiColors.surface2,
+                              highlightColor: OmiColors.surface3,
+                              duration: const Duration(seconds: 1),
+                            ),
+                            child: const Bone.multiText(),
+                          ),
+                        )
+                      : TextFormField(
+                          maxLines: null,
+                          minLines: 4,
+                          validator: (value) {
+                            if (value == null || value.isEmpty) {
+                              return l10n.pleaseProvideValidDescription;
+                            }
+                            return null;
+                          },
+                          controller: appDescriptionController,
+                          decoration: appFormInputDecoration(
+                            label: '${l10n.descriptionLabel}*',
+                            alignLabelWithHint: true,
+                          ),
+                          style: TextStyle(color: OmiColors.textPrimary),
+                        ),
+                  if (appDescriptionController.text.isNotEmpty && appNameController.text.isNotEmpty)
+                    Positioned(
+                      bottom: 12,
+                      right: 12,
+                      child: OmiIconButton(
+                        icon: SvgPicture.asset(
+                          Assets.images.aiMagic,
+                          colorFilter: ColorFilter.mode(OmiColors.textPrimary, BlendMode.srcIn),
+                        ),
+                        label: l10n.generateDescription,
+                        onPressed: () async {
+                          await context.read<AddAppProvider>().generateDescription();
+                        },
+                      ),
+                    ),
+                ],
+              ),
+              const SizedBox(height: OmiSpacing.xxs),
+              if (allowPaidApps) ...[
+                const SizedBox(height: OmiSpacing.xxs),
+                AppFormSelectorField(
+                  value: appPricing,
+                  placeholder: l10n.noneSelected,
+                  onTap: () => _pickPricing(context),
+                ),
+              ],
+            ],
+          ),
         ),
       ),
     );

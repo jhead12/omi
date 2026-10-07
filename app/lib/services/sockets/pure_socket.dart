@@ -1,34 +1,33 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:math';
 
-import 'package:flutter/material.dart';
-import 'package:instabug_flutter/instabug_flutter.dart';
-import 'package:internet_connection_checker_plus/internet_connection_checker_plus.dart';
 import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/status.dart' as socket_channel_status;
 import 'package:web_socket_channel/web_socket_channel.dart';
+
 import 'package:omi/backend/http/shared.dart';
+import 'package:omi/utils/debug_log_manager.dart';
+import 'package:omi/utils/logger.dart';
+import 'package:omi/utils/platform/platform_manager.dart';
 
 enum PureSocketStatus { notConnected, connecting, connected, disconnected }
 
 abstract class IPureSocketListener {
   void onConnected();
   void onMessage(dynamic message);
-  void onClosed();
+  void onClosed([int? closeCode]);
   void onError(Object err, StackTrace trace);
-
-  void onInternetConnectionFailed() {}
-
-  void onMaxRetriesReach() {}
 }
 
 abstract class IPureSocket {
+  PureSocketStatus get status;
+
   Future<bool> connect();
   Future disconnect();
+  Future stop();
   void send(dynamic message);
 
-  void onInternetSatusChanged(InternetStatus status);
+  void setListener(IPureSocketListener listener);
 
   void onMessage(dynamic message);
   void onConnected();
@@ -40,45 +39,12 @@ class PureSocketMessage {
   String? raw;
 }
 
-class PureCore {
-  late InternetConnection internetConnection;
-
-  factory PureCore() => _instance;
-
-  /// The singleton instance of [PureCore].
-  static final _instance = PureCore.createInstance();
-
-  PureCore.createInstance() {
-    internetConnection = InternetConnection.createInstance(
-      useDefaultOptions: false,
-      customCheckOptions: [
-        InternetCheckOption(
-          uri: Uri.parse('https://one.one.one.one'),
-          timeout: const Duration(seconds: 12),
-        ),
-        InternetCheckOption(
-          uri: Uri.parse('https://icanhazip.com/'),
-          timeout: const Duration(seconds: 12),
-        ),
-        InternetCheckOption(
-          uri: Uri.parse('https://jsonplaceholder.typicode.com/todos/1'),
-          timeout: const Duration(seconds: 12),
-        ),
-        InternetCheckOption(
-          uri: Uri.parse('https://reqres.in/api/users/1'),
-          timeout: const Duration(seconds: 12),
-        ),
-      ],
-    );
-  }
-}
+typedef SocketHeadersProvider = Future<Map<String, String>> Function();
 
 class PureSocket implements IPureSocket {
-  StreamSubscription<InternetStatus>? _internetStatusListener;
-  InternetStatus? _internetStatus;
-  Timer? _internetLostDelayTimer;
-
   WebSocketChannel? _channel;
+  StreamSubscription<dynamic>? _subscription;
+  int _connectionGeneration = 0;
   WebSocketChannel get channel {
     if (_channel == null) {
       throw Exception('Socket is not connected');
@@ -87,134 +53,188 @@ class PureSocket implements IPureSocket {
   }
 
   PureSocketStatus _status = PureSocketStatus.notConnected;
+  @override
   PureSocketStatus get status => _status;
 
   IPureSocketListener? _listener;
 
-  int _retries = 0;
-
   String url;
+  final SocketHeadersProvider _headersProvider;
+  final Map<String, String> _extraHeaders;
 
-  PureSocket(this.url) {
-    _internetStatusListener = PureCore().internetConnection.onStatusChange.listen((InternetStatus status) {
-      onInternetSatusChanged(status);
-    });
-  }
+  PureSocket(this.url, {SocketHeadersProvider? headersProvider, Map<String, String> extraHeaders = const {}})
+      : _headersProvider =
+            headersProvider ?? (() => buildHeaders(requireAuthCheck: true, url: url, forWebSocket: true)),
+        _extraHeaders = Map.unmodifiable(extraHeaders);
 
+  @override
   void setListener(IPureSocketListener listener) {
     _listener = listener;
   }
 
   @override
   Future<bool> connect() async {
-    return await _connect();
-  }
-
-  Future<bool> _connect() async {
     if (_status == PureSocketStatus.connecting || _status == PureSocketStatus.connected) {
       return false;
     }
 
-    debugPrint("request wss ${url}");
-    _channel = IOWebSocketChannel.connect(
+    // Reserve the attempt before auth can yield. Teardown invalidates both
+    // auth and transport readiness, so neither can revive a retired session.
+    final generation = ++_connectionGeneration;
+    _status = PureSocketStatus.connecting;
+    Logger.debug("request wss $url");
+    final Map<String, String> headers;
+    try {
+      headers = {...await _headersProvider(), ..._extraHeaders};
+    } on AuthTokenUnavailableException catch (e) {
+      Logger.debug('[Socket] Connect blocked before send: ${e.result.runtimeType}');
+      if (generation == _connectionGeneration) _status = PureSocketStatus.notConnected;
+      return false;
+    } catch (_) {
+      if (generation == _connectionGeneration) _status = PureSocketStatus.notConnected;
+      rethrow;
+    }
+    if (generation != _connectionGeneration) return false;
+
+    final channel = IOWebSocketChannel.connect(
       url,
-      headers: {
-        'Authorization': await getAuthHeader(),
-      },
+      headers: headers,
       pingInterval: const Duration(seconds: 20),
       connectTimeout: const Duration(seconds: 15),
     );
-    if (_channel?.ready == null) {
-      return false;
-    }
+    _channel = channel;
+    // Consume connection errors even when this attempt has been retired.
+    _subscription = channel.stream.listen(
+      (message) {
+        if (generation != _connectionGeneration) return;
+        if (message == "ping") {
+          // Logger.debug(message);
+          // Pong frame added manually https://www.rfc-editor.org/rfc/rfc6455#section-5.5.2
+          channel.sink.add([0x8A, 0x00]);
+          return;
+        }
+        onMessage(message);
+      },
+      onError: (err, trace) {
+        // Handshake failures are handled by ready below, without emitting a
+        // second failure through the established-connection listener.
+        if (generation == _connectionGeneration && _status == PureSocketStatus.connected) onError(err, trace);
+      },
+      onDone: () {
+        if (generation != _connectionGeneration) return;
+        Logger.debug("onDone with close code: ${channel.closeCode}");
+        onClosed(channel.closeCode);
+      },
+      cancelOnError: true,
+    );
 
-    _status = PureSocketStatus.connecting;
     dynamic err;
     try {
       await channel.ready;
     } on TimeoutException catch (e) {
       err = e;
+      DebugLogManager.logWarning('pure_socket_connect_timeout', {'url': url, 'error': e.toString()});
     } on SocketException catch (e) {
       err = e;
+      DebugLogManager.logWarning('pure_socket_connect_socket_error', {'url': url, 'error': e.toString()});
     } on WebSocketChannelException catch (e) {
       err = e;
+      DebugLogManager.logWarning('pure_socket_connect_websocket_error', {'url': url, 'error': e.toString()});
     }
+    if (generation != _connectionGeneration) return false;
     if (err != null) {
-      print("Error: $err");
+      Logger.debug("[Socket] Connect error: $err");
+      _retireChannel();
       _status = PureSocketStatus.notConnected;
       return false;
     }
     _status = PureSocketStatus.connected;
-    _retries = 0;
+    DebugLogManager.logEvent('pure_socket_connected', {'url': url});
     onConnected();
 
-    final that = this;
+    return generation == _connectionGeneration;
+  }
 
-    _channel?.stream.listen(
-      (message) {
-        if (message == "ping") {
-          debugPrint(message);
-          // Pong frame added manually https://www.rfc-editor.org/rfc/rfc6455#section-5.5.2
-          _channel?.sink.add([0x8A, 0x00]);
-          return;
-        }
-        that.onMessage(message);
-      },
-      onError: (err, trace) {
-        that.onError(err, trace);
-      },
-      onDone: () {
-        debugPrint("onDone");
-        that.onClosed();
-      },
-      cancelOnError: true,
-    );
-
-    return true;
+  void _retireChannel() {
+    _connectionGeneration++;
+    final channel = _channel;
+    final subscription = _subscription;
+    _channel = null;
+    _subscription = null;
+    // Close even while connecting; the adapter delivers the queued close
+    // when its handshake finishes. Never wait for a peer acknowledgement.
+    if (channel != null) unawaited(channel.sink.close(socket_channel_status.normalClosure));
+    if (subscription != null) unawaited(subscription.cancel());
   }
 
   @override
   Future disconnect() async {
-    if (_status == PureSocketStatus.connected) {
-      // Warn: should not use await cause dead end by socket closed.
-      _channel?.sink.close(socket_channel_status.normalClosure);
-    }
-    _status = PureSocketStatus.disconnected;
-    debugPrint("disconnect");
-    onClosed();
-  }
-
-  Future _cleanUp() async {
-    _internetLostDelayTimer?.cancel();
-    _internetStatusListener?.cancel();
-  }
-
-  Future stop() async {
-    await disconnect();
-    await _cleanUp();
+    DebugLogManager.logEvent('pure_socket_disconnecting', {'url': url, 'current_status': _status.toString()});
+    if (_status == PureSocketStatus.disconnected && _channel == null) return;
+    Logger.debug("[Socket] disconnect");
+    onClosed(_channel?.closeCode);
   }
 
   @override
-  void onClosed() {
+  Future stop() async {
+    DebugLogManager.logEvent('pure_socket_stopping', {'url': url});
+    await disconnect();
+  }
+
+  @override
+  void onClosed([int? closeCode]) {
     _status = PureSocketStatus.disconnected;
-    debugPrint("Socket closed");
-    _listener?.onClosed();
+    _retireChannel();
+    final closeReason = _getCloseCodeReason(closeCode);
+    Logger.debug("Socket closed with code: $closeCode ($closeReason)");
+
+    DebugLogManager.logEvent('pure_socket_closed', {
+      'close_code': closeCode ?? -1,
+      'close_reason': closeReason,
+      'url': url,
+    });
+
+    _listener?.onClosed(closeCode);
+  }
+
+  String _getCloseCodeReason(int? code) {
+    switch (code) {
+      case 1000:
+        return 'normal_closure';
+      case 1001:
+        return 'going_away_os_or_background';
+      case 1006:
+        return 'abnormal_closure';
+      case 1008:
+        return 'policy_violation_or_auth_error';
+      case 1011:
+        return 'server_error';
+      case 4001:
+        return 'auth_token_refresh_required';
+      case 4004:
+        return 'auth_relogin_required';
+      case 4005:
+        return 'account_deletion_in_progress';
+      default:
+        return 'unknown';
+    }
   }
 
   @override
   void onError(Object err, StackTrace trace) {
     _status = PureSocketStatus.disconnected;
-    print("Error: ${err}");
-    debugPrintStack(stackTrace: trace);
+    _retireChannel();
+    Logger.debug("[Socket] Error: $err");
+
+    DebugLogManager.logError(err, trace, 'pure_socket_error', {'url': url});
 
     _listener?.onError(err, trace);
-
-    CrashReporting.reportHandledCrash(err, trace, level: NonFatalExceptionLevel.error);
+    PlatformManager.instance.crashReporter.reportCrash(err, trace);
   }
 
   @override
   void onMessage(dynamic message) {
-    debugPrint("[Socket] Message $message");
+    // Logger.debug("[Socket] Message $message");
     _listener?.onMessage(message);
   }
 
@@ -226,62 +246,5 @@ class PureSocket implements IPureSocket {
   @override
   void send(message) {
     _channel?.sink.add(message);
-  }
-
-  void _reconnect() async {
-    debugPrint("[Socket] reconnect...${_retries + 1}...");
-    const int initialBackoffTimeMs = 1000; // 1 second
-    const double multiplier = 1.5;
-    const int maxRetries = 8;
-
-    if (_status == PureSocketStatus.connecting || _status == PureSocketStatus.connected) {
-      debugPrint("[Socket] Can not reconnect, because socket is $_status");
-      return;
-    }
-
-    await _cleanUp();
-
-    var ok = await _connect();
-    if (ok) {
-      return;
-    }
-
-    // retry
-    int waitInMilliseconds = pow(multiplier, _retries).toInt() * initialBackoffTimeMs;
-    await Future.delayed(Duration(milliseconds: waitInMilliseconds));
-    _retries++;
-    if (_retries > maxRetries) {
-      debugPrint("[Socket] Reach max retries $maxRetries");
-      _listener?.onMaxRetriesReach();
-      return;
-    }
-    _reconnect();
-  }
-
-  @override
-  void onInternetSatusChanged(InternetStatus status) {
-    debugPrint("[Socket] Internet connection changed $status socket $_status");
-    _internetStatus = status;
-    switch (status) {
-      case InternetStatus.connected:
-        if (_status == PureSocketStatus.connected || _status == PureSocketStatus.connecting) {
-          return;
-        }
-        _reconnect();
-        break;
-      case InternetStatus.disconnected:
-        var that = this;
-        _internetLostDelayTimer?.cancel();
-        _internetLostDelayTimer = Timer(const Duration(seconds: 60), () async {
-          if (_internetStatus != InternetStatus.disconnected) {
-            return;
-          }
-
-          await that.disconnect();
-          _listener?.onInternetConnectionFailed();
-        });
-
-        break;
-    }
   }
 }

@@ -1,12 +1,18 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
-import 'package:omi/widgets/dialog.dart';
-import 'package:internet_connection_checker_plus/internet_connection_checker_plus.dart';
+
+import 'package:omi/services/connectivity_service.dart';
+import 'package:omi/ui/feedback/omi_dialogs.dart';
+import 'package:omi/utils/l10n_extensions.dart';
 
 class ConnectivityProvider extends ChangeNotifier {
   bool _isConnected = true;
   bool _previousConnection = true;
   bool _isInitialized = false;
-  final InternetConnection _internetConnection = InternetConnection();
+
+  final ConnectivityService _connectivityService = ConnectivityService();
+  StreamSubscription? _connectionSubscription;
 
   bool get isConnected => _isConnected;
   bool get previousConnection => _previousConnection;
@@ -16,46 +22,33 @@ class ConnectivityProvider extends ChangeNotifier {
     init();
   }
 
-  Future<void> init() async {
-    bool result = await _internetConnection.hasInternetAccess;
-    _isConnected = result;
-    _previousConnection = result;
+  void init() {
+    _isConnected = _connectivityService.isConnected;
+    _previousConnection = _isConnected;
     _isInitialized = true;
-    notifyListeners();
 
-    _internetConnection.onStatusChange.listen((InternetStatus result) {
-      if (_isInitialized) {
-        // Only handle status changes after initialization
-        _previousConnection = _isConnected;
-        isInternetConnected(result);
-      }
-    });
+    _connectionSubscription = _connectivityService.onConnectionChange.listen(_updateConnectionState);
   }
 
-  bool isInternetConnected(InternetStatus? result) {
-    if (result == InternetStatus.disconnected) {
-      _isConnected = false;
+  @override
+  void dispose() {
+    _connectionSubscription?.cancel();
+    super.dispose();
+  }
+
+  void _updateConnectionState(bool newIsConnected) {
+    if (_isConnected != newIsConnected) {
+      _previousConnection = _isConnected;
+      _isConnected = newIsConnected;
       notifyListeners();
-      return false;
-    } else {
-      _isConnected = true;
-      notifyListeners();
-      return true;
     }
   }
 
   static void showNoInternetDialog(BuildContext context) {
-    showDialog(
-      context: context,
-      builder: (c) => getDialog(
-        context,
-        () => Navigator.pop(context),
-        () => Navigator.pop(context),
-        'No Internet Connection',
-        'You need an internet connection to execute this action. Please check your connection and try again.',
-        singleButton: true,
-        okButtonText: 'Ok',
-      ),
+    showOmiAlert(
+      context,
+      title: context.l10n.noInternetConnection,
+      message: context.l10n.pleaseCheckInternetConnectionAndTryAgain,
     );
   }
 }

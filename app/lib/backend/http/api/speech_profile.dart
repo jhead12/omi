@@ -1,62 +1,104 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:flutter/material.dart';
 import 'package:omi/backend/http/shared.dart';
+import 'package:omi/backend/schema/gen/device_speech_wire.g.dart' as wire;
+import 'package:omi/backend/schema/gen/misc_wire.g.dart' as misc_wire;
 import 'package:omi/env/env.dart';
-import 'package:http/http.dart' as http;
-import 'package:path/path.dart';
+import 'package:omi/utils/logger.dart';
+
+class SpeechProfileUploadException implements Exception {
+  const SpeechProfileUploadException(this.statusCode, {this.detail});
+  final int statusCode;
+  final String? detail;
+  @override
+  String toString() => 'Speech profile upload failed ($statusCode)';
+}
 
 Future<bool> userHasSpeakerProfile() async {
-  var response = await makeApiCall(
-    url: '${Env.apiBaseUrl}v3/speech-profile',
-    headers: {},
-    method: 'GET',
-    body: '',
-  );
+  var response = await makeApiCall(url: '${Env.apiBaseUrl}v3/speech-profile', headers: {}, method: 'GET', body: '');
   if (response == null) return true;
-  debugPrint('userHasSpeakerProfile: ${response.body}');
+  Logger.debug('userHasSpeakerProfile: ${response.body}');
   if (response.statusCode == 200) {
-    return jsonDecode(response.body)['has_profile'] ?? false;
+    try {
+      return wire.GeneratedHasSpeechProfileResponse.fromJson(
+        jsonDecode(response.body) as Map<String, dynamic>,
+      ).hasProfile;
+    } catch (e) {
+      Logger.debug('Failed to parse userHasSpeakerProfile response: $e');
+      return true;
+    }
   }
   return true; // to avoid showing the banner if the request fails or there's no internet.
 }
 
-Future<String?> getUserSpeechProfile() async {
+/// Pre-flight check before entering the recording UI, so a known-down
+/// streaming primary surfaces as an upfront error dialog instead of a dead
+/// recording screen with no questions/progress ever arriving.
+Future<bool> isSttAvailable() async {
   var response = await makeApiCall(
-    url: '${Env.apiBaseUrl}v4/speech-profile',
+    url: '${Env.apiBaseUrl}v3/speech-profile/stt-availability',
     headers: {},
     method: 'GET',
     body: '',
   );
+  // Fail open: a hiccup on the check itself shouldn't block a working flow —
+  // the existing STT_UNAVAILABLE detection after repeated failed connects is
+  // still the real safety net.
+  if (response == null) return true;
+  if (response.statusCode == 200) {
+    try {
+      return wire.GeneratedSttAvailabilityResponse.fromJson(
+        jsonDecode(response.body) as Map<String, dynamic>,
+      ).available;
+    } catch (e) {
+      Logger.debug('Failed to parse isSttAvailable response: $e');
+      return true;
+    }
+  }
+  return true;
+}
+
+Future<String?> getUserSpeechProfile() async {
+  var response = await makeApiCall(url: '${Env.apiBaseUrl}v4/speech-profile', headers: {}, method: 'GET', body: '');
   if (response == null) return null;
-  debugPrint('userHasSpeakerProfile: ${response.body}');
-  if (response.statusCode == 200) return jsonDecode(response.body)['url'];
+  Logger.debug('userHasSpeakerProfile: ${response.body}');
+  if (response.statusCode == 200) {
+    return wire.GeneratedSpeechProfileResponse.fromJson(jsonDecode(response.body) as Map<String, dynamic>).url;
+  }
   return null;
 }
 
-Future<bool> uploadProfile(File file) async {
-  var request = http.MultipartRequest(
-    'POST',
-    Uri.parse('${Env.apiBaseUrl}v3/upload-audio'),
-  );
-  request.files.add(await http.MultipartFile.fromPath('file', file.path, filename: basename(file.path)));
-  request.headers.addAll({'Authorization': await getAuthHeader()});
-
+String? _errorDetail(String body) {
   try {
-    var streamedResponse = await request.send();
-    var response = await http.Response.fromStream(streamedResponse);
+    final detail = misc_wire.GeneratedErrorResponse.fromJson(jsonDecode(body) as Map<String, dynamic>).detail;
+    return detail is String ? detail : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+Future<bool> uploadProfile(File file) async {
+  try {
+    var response = await makeMultipartApiCall(
+      url: '${Env.apiBaseUrl}v3/upload-audio',
+      files: [file],
+      fileFieldName: 'file',
+    );
 
     if (response.statusCode == 200) {
-      debugPrint('uploadProfile Response body: ${jsonDecode(response.body)}');
+      final data = wire.GeneratedSpeechProfileUploadResponse.fromJson(
+        jsonDecode(response.body) as Map<String, dynamic>,
+      );
+      Logger.debug('uploadProfile Response url: ${data.url}');
       return true;
     } else {
-      debugPrint('Failed to upload sample. Status code: ${response.statusCode}');
-      throw Exception('Failed to upload sample. Status code: ${response.statusCode}');
+      Logger.debug('Failed to upload sample. Status code: ${response.statusCode} body: ${response.body}');
+      throw SpeechProfileUploadException(response.statusCode, detail: _errorDetail(response.body));
     }
   } catch (e) {
-    debugPrint('An error occurred uploadSample: $e');
-    throw Exception('An error occurred uploadSample: $e');
+    Logger.debug('An error occurred uploadSample: $e');
+    rethrow;
   }
 }
 
@@ -68,21 +110,21 @@ Future<List<String>> getExpandedProfileSamples() async {
     body: '',
   );
   if (response == null) return [];
-  debugPrint('getExpandedProfileSamples: ${response.body}');
+  Logger.debug('getExpandedProfileSamples: ${response.body}');
   if (response.statusCode == 200) {
-    var data = jsonDecode(response.body);
-    if (data != null) {
-      return List<String>.from(data);
+    try {
+      final decoded = jsonDecode(response.body);
+      if (decoded is! List<dynamic>) return [];
+      return wire.GeneratedExpandedSpeechProfileSamplesResponse.fromJsonList(decoded).items;
+    } catch (e) {
+      Logger.debug('Failed to parse getExpandedProfileSamples response: $e');
+      return [];
     }
   }
   return [];
 }
 
-Future<bool> deleteProfileSample(
-  String conversationId,
-  int segmentIdx, {
-  String? personId,
-}) async {
+Future<bool> deleteProfileSample(String conversationId, int segmentIdx, {String? personId}) async {
   var response = await makeApiCall(
     url:
         '${Env.apiBaseUrl}v3/speech-profile/expand?memory_id=$conversationId&segment_idx=$segmentIdx&person_id=$personId',
@@ -91,7 +133,17 @@ Future<bool> deleteProfileSample(
     body: '',
   );
   if (response == null) return false;
-  debugPrint('deleteProfileSample: ${response.body}');
-  if (response.statusCode == 200) return true;
+  Logger.debug('deleteProfileSample: ${response.body}');
+  if (response.statusCode == 200) {
+    try {
+      final data = wire.GeneratedSpeechProfileMutationResponse.fromJson(
+        jsonDecode(response.body) as Map<String, dynamic>,
+      );
+      return data.status == 'ok';
+    } catch (e) {
+      Logger.debug('Failed to parse deleteProfileSample response: $e');
+      return false;
+    }
+  }
   return false;
 }

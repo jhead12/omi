@@ -1,12 +1,13 @@
-import 'dart:io';
+import 'package:flutter/material.dart';
 
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:flutter/cupertino.dart';
-import 'package:flutter/material.dart';
-import 'package:omi/backend/auth.dart';
-import 'package:omi/backend/preferences.dart';
-import 'package:omi/utils/alerts/app_snackbar.dart';
 
+import 'package:omi/backend/preferences.dart';
+import 'package:omi/services/auth_service.dart';
+import 'package:omi/ui/ui.dart';
+import 'package:omi/utils/l10n_extensions.dart';
+
+/// The "Edit Name" dialog, shown with `showDialog(builder: (_) => const ChangeNameWidget())`.
 class ChangeNameWidget extends StatefulWidget {
   const ChangeNameWidget({super.key});
 
@@ -21,97 +22,77 @@ class _ChangeNameWidgetState extends State<ChangeNameWidget> {
 
   @override
   void initState() {
-    user = getFirebaseUser();
-    nameController = TextEditingController(text: user?.displayName ?? '');
+    user = AuthService.instance.getFirebaseUser();
+    nameController = TextEditingController(
+      text: SharedPreferencesUtil().givenName.isNotEmpty ? SharedPreferencesUtil().givenName : user?.displayName ?? '',
+    );
+    nameController.addListener(_onNameChanged);
     super.initState();
   }
 
   @override
+  void dispose() {
+    nameController.removeListener(_onNameChanged);
+    nameController.dispose();
+    super.dispose();
+  }
+
+  void _onNameChanged() => setState(() {});
+
+  bool get _canSave => !isSaving && nameController.text.trim().isNotEmpty;
+
+  void _save() {
+    final name = nameController.text.trim();
+    if (name.isEmpty) return;
+    setState(() => isSaving = true);
+    SharedPreferencesUtil().givenName = name;
+    AuthService.instance.updateGivenName(name);
+    OmiFeedback.confirm(context, context.l10n.nameUpdatedSuccessfully);
+    Navigator.of(context).pop();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    if (Platform.isIOS) {
-      return CupertinoAlertDialog(
-        content: Padding(
-          padding: const EdgeInsets.all(8.0),
-          child: Column(
-            children: <Widget>[
-              const Text('How Omi should call you?'),
-              const SizedBox(height: 8),
-              CupertinoTextField(
-                controller: nameController,
-                placeholderStyle: const TextStyle(color: Colors.white54),
-                style: const TextStyle(color: Colors.white),
-              ),
-            ],
-          ),
-        ),
-        actions: <Widget>[
-          CupertinoDialogAction(
-            textStyle: const TextStyle(color: Colors.white),
-            onPressed: () {
-              Navigator.of(context).pop();
-            },
-            child: const Text('Cancel'),
-          ),
-          CupertinoDialogAction(
-            textStyle: const TextStyle(color: Colors.white),
-            onPressed: () {
-              if (nameController.text.isEmpty || nameController.text.trim().isEmpty) {
-                AppSnackbar.showSnackbarError('Name cannot be empty');
-                return;
-              }
-              SharedPreferencesUtil().givenName = nameController.text;
-              updateGivenName(nameController.text);
-              AppSnackbar.showSnackbar('Name updated successfully!');
-              Navigator.of(context).pop();
-            },
-            child: const Text('Save'),
-          ),
-        ],
-      );
-    } else {
-      return AlertDialog(
-        content: Padding(
-          padding: const EdgeInsets.all(8.0),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: <Widget>[
-              const Text('How Omi should call you?'),
-              const SizedBox(height: 8),
-              TextField(
-                controller: nameController,
-                style: const TextStyle(color: Colors.white),
-              ),
-            ],
-          ),
-        ),
-        actions: <Widget>[
-          TextButton(
-            onPressed: () {
-              Navigator.of(context).pop();
-            },
-            child: const Text(
-              'Cancel',
-              style: TextStyle(color: Colors.white),
+    return OmiAlertDialog(
+      title: context.l10n.editName,
+      message: context.l10n.howShouldOmiCallYou,
+      // The Cupertino dialog has no Material ancestor; the text field needs one.
+      content: Material(
+        type: MaterialType.transparency,
+        child: TextField(
+          controller: nameController,
+          autofocus: true,
+          enabled: !isSaving,
+          textCapitalization: TextCapitalization.words,
+          textInputAction: TextInputAction.done,
+          onSubmitted: (_) {
+            if (_canSave) _save();
+          },
+          style: OmiType.body,
+          decoration: InputDecoration(
+            hintText: context.l10n.enterYourName,
+            hintStyle: OmiType.body.copyWith(color: OmiColors.textTertiary),
+            filled: true,
+            fillColor: OmiColors.surface2,
+            isDense: true,
+            contentPadding: const EdgeInsets.symmetric(horizontal: OmiSpacing.sm, vertical: OmiSpacing.sm),
+            border: const OutlineInputBorder(borderRadius: OmiRadius.smAll, borderSide: BorderSide.none),
+            enabledBorder: const OutlineInputBorder(borderRadius: OmiRadius.smAll, borderSide: BorderSide.none),
+            focusedBorder: OutlineInputBorder(
+              borderRadius: OmiRadius.smAll,
+              borderSide: BorderSide(color: OmiColors.textTertiary),
             ),
           ),
-          TextButton(
-            onPressed: () {
-              if (nameController.text.isEmpty || nameController.text.trim().isEmpty) {
-                AppSnackbar.showSnackbarError('Name cannot be empty');
-                return;
-              }
-              SharedPreferencesUtil().givenName = nameController.text;
-              updateGivenName(nameController.text);
-              AppSnackbar.showSnackbar('Name updated successfully!');
-              Navigator.of(context).pop();
-            },
-            child: const Text(
-              'Save',
-              style: TextStyle(color: Colors.white),
-            ),
-          ),
-        ],
-      );
-    }
+        ),
+      ),
+      actions: [
+        OmiDialogAction(label: context.l10n.cancel, onPressed: () => Navigator.of(context).pop()),
+        OmiDialogAction(
+          label: isSaving ? context.l10n.saving : context.l10n.save,
+          isDefault: true,
+          onPressed: _canSave ? _save : null,
+        ),
+      ],
+    );
   }
 }

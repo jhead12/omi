@@ -1,51 +1,30 @@
 import 'package:flutter/material.dart';
 
-/// UI Guidelines to ensure consistent styling throughout the app
-/// Use this class for reference when creating new UI components
+/// Legacy style constants. Superseded by the tokens in `lib/ui/omi_tokens.dart`: use `OmiColors`,
+/// `OmiType`, `OmiRadius` and `OmiSpacing` in new code, and migrate a file off `AppStyles` when you
+/// touch it. The values here are intentionally left as they were so existing screens do not shift.
 class AppStyles {
   // Text Styles
-  static const TextStyle title = TextStyle(
-    fontSize: 18,
-    fontWeight: FontWeight.w600,
-    color: Colors.white,
-  );
+  static const TextStyle title = TextStyle(fontSize: 18, fontWeight: FontWeight.w600, color: Colors.white);
 
-  static const TextStyle subtitle = TextStyle(
-    fontSize: 16,
-    fontWeight: FontWeight.w500,
-    color: Colors.white,
-  );
+  static const TextStyle subtitle = TextStyle(fontSize: 16, fontWeight: FontWeight.w500, color: Colors.white);
 
-  static const TextStyle body = TextStyle(
-    fontSize: 15,
-    height: 1.4,
-    color: Colors.white,
-  );
+  static const TextStyle body = TextStyle(fontSize: 15, height: 1.4, color: Colors.white);
 
-  static const TextStyle caption = TextStyle(
-    fontSize: 14,
-    color: Colors.white70,
-  );
+  static const TextStyle caption = TextStyle(fontSize: 14, color: Colors.white70);
 
-  static const TextStyle small = TextStyle(
-    fontSize: 12,
-    color: Colors.white70,
-  );
+  static const TextStyle small = TextStyle(fontSize: 12, color: Colors.white70);
 
-  static const TextStyle label = TextStyle(
-    fontSize: 12,
-    fontWeight: FontWeight.w500,
-    color: Colors.white70,
-  );
+  static const TextStyle label = TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: Colors.white70);
 
   // Colors
-  static final Color backgroundPrimary = Colors.black;
-  static final Color backgroundSecondary = Colors.grey.shade900;
-  static final Color backgroundTertiary = Colors.grey.shade800;
+  static const Color backgroundPrimary = Colors.black;
+  static const Color backgroundSecondary = Color(0xFF1F1F25);
+  static const Color backgroundTertiary = Color(0xFF35343B);
 
   static const Color textPrimary = Colors.white;
-  static final Color textSecondary = Colors.white.withOpacity(0.8);
-  static final Color textTertiary = Colors.white.withOpacity(0.6);
+  static final Color textSecondary = Colors.white.withValues(alpha: 0.8);
+  static final Color textTertiary = Colors.white.withValues(alpha: 0.6);
 
   static const Color accent = Colors.blue;
   static final Color error = Colors.red.shade800;
@@ -69,27 +48,18 @@ class AppStyles {
   static final cardDecoration = BoxDecoration(
     color: backgroundSecondary,
     borderRadius: BorderRadius.circular(radiusLarge),
-    boxShadow: [
-      BoxShadow(
-        color: Colors.black.withOpacity(0.1),
-        blurRadius: 4,
-        offset: const Offset(0, 2),
-      ),
-    ],
+    boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.1), blurRadius: 4, offset: const Offset(0, 2))],
   );
 
   static final inputDecoration = InputDecoration(
     filled: true,
     fillColor: backgroundTertiary,
     contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-    border: OutlineInputBorder(
-      borderRadius: BorderRadius.circular(radiusMedium),
-      borderSide: BorderSide.none,
-    ),
+    border: OutlineInputBorder(borderRadius: BorderRadius.circular(radiusMedium), borderSide: BorderSide.none),
   );
 
   static final chipDecoration = BoxDecoration(
-    color: backgroundTertiary.withOpacity(0.6),
+    color: backgroundTertiary.withValues(alpha: 0.6),
     borderRadius: BorderRadius.circular(radiusCircular),
   );
 }

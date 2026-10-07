@@ -1,45 +1,37 @@
 import json
 import os
-# noinspection PyUnresolvedReferences
-from typing import List
 
 # noinspection PyUnresolvedReferences
-import numpy as np
+from typing import Any, List, cast
+
 # noinspection PyUnresolvedReferences
 import plotly.graph_objects as go
-# noinspection PyUnresolvedReferences
-import umap
+
 from dotenv import load_dotenv
 from langchain_openai import OpenAIEmbeddings
 from pinecone import Pinecone
-# noinspection PyUnresolvedReferences
-from plotly.subplots import make_subplots
-
-# noinspection PyUnresolvedReferences
-from models.conversation import Conversation
 
 load_dotenv('../../.env')
-os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = '../../' + os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
+os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = '../../' + os.getenv('GOOGLE_APPLICATION_CREDENTIALS', '')
 
+index: Any
 if os.getenv('PINECONE_API_KEY') is not None:
-    pc = Pinecone(api_key=os.getenv('PINECONE_API_KEY', ''))
+    pc = cast(Any, Pinecone(api_key=os.getenv('PINECONE_API_KEY', '')))
     index = pc.Index(os.getenv('PINECONE_INDEX_NAME', ''))
 else:
     index = None
 
 import database.conversations as conversations_db
-# noinspection PyUnresolvedReferences
-import database.memories as facts_d
 
 uid = 'viUv7GtdoHXbK1UBCDlPuTDuPgJ2'
 
 openai_embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
 
 
-def query_vectors(query: str, uid: str, k: int = 1000) -> List[str]:
+def query_vectors(query: str, uid: str, k: int = 1000) -> List[List[Any]]:
     xq = openai_embeddings.embed_query(query)
     xc = index.query(vector=xq, top_k=k, filter={'uid': uid}, namespace="ns1", include_values=True)
-    data = []
+    data: List[List[Any]] = []
     for item in xc['matches']:
         data.append([item['id'].replace(f'{uid}-', ''), item['values']])
     print('Found:', len(data), 'vectors')
@@ -59,7 +51,7 @@ def get_memories(ignore_cached: bool = False):
         return json.loads(f.read())
 
 
-def get_all_markers(data, data_points, target):
+def get_all_markers(data: List[List[Any]], data_points: Any, target: int) -> Any:
     return go.Scatter(
         x=data_points[target:, 0],
         y=data_points[target:, 1],
@@ -67,11 +59,11 @@ def get_all_markers(data, data_points, target):
         marker=dict(size=8, opacity=0.5, color='blue'),
         text=[f"{item[0]}" for item in data[5:]],
         hoverinfo='text',
-        name='Other Memories'
+        name='Other Memories',
     )
 
 
-def get_top_markers(data, data_points, target):
+def get_top_markers(data: List[List[Any]], data_points: Any, target: int) -> Any:
     return go.Scatter(
         x=data_points[:target, 0],
         y=data_points[:target, 1],
@@ -79,35 +71,30 @@ def get_top_markers(data, data_points, target):
         marker=dict(size=10, opacity=0.8, color='green'),
         text=[f"Top {i + 1}: {item[0]}" for i, item in enumerate(data[:5])],
         hoverinfo='text',
-        name='Top Matches'
+        name='Top Matches',
     )
 
 
-def get_query_marker(query_point, query):
+def get_query_marker(query_point: Any, query: str) -> Any:
     return go.Scatter(
         x=[query_point[0]],
         y=[query_point[1]],
         mode='markers',
-        marker=dict(
-            symbol='x',
-            size=12,
-            color='red',
-            line=dict(width=2)
-        ),
+        marker=dict(symbol='x', size=12, color='red', line=dict(width=2)),
         text=[query],
         hoverinfo='text',
-        name='Query'
+        name='Query',
     )
 
 
-def generate_html_visualization(fig, file_name: str = 'embedding_visualization.html'):
+def generate_html_visualization(fig: Any, file_name: str = 'embedding_visualization.html') -> None:
     fig.update_layout(
         title=f'Embedding Visualization',
         xaxis_title='UMAP Dimension 1',
         yaxis_title='UMAP Dimension 2',
         width=800,
         height=600,
-        showlegend=True
+        showlegend=True,
     )
 
     # Generate HTML

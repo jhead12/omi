@@ -1,13 +1,14 @@
-import 'package:cached_network_image/cached_network_image.dart';
+import 'package:omi/utils/platform/platform_manager.dart';
 import 'package:flutter/material.dart';
-import 'package:omi/backend/schema/app.dart';
-import 'package:omi/providers/app_provider.dart';
-import 'package:omi/utils/analytics/mixpanel.dart';
-import 'package:omi/utils/other/temp.dart';
-import 'package:omi/widgets/dialog.dart';
-import 'package:omi/widgets/extensions/string.dart';
-import 'package:provider/provider.dart';
 
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:omi/widgets/shimmer_with_timeout.dart';
+
+import 'package:omi/backend/schema/app.dart';
+import 'package:omi/pages/apps/widgets/app_actions.dart';
+import 'package:omi/ui/ui.dart';
+import 'package:omi/utils/other/temp.dart';
+import 'package:omi/widgets/extensions/string.dart';
 import 'app_detail/app_detail.dart';
 
 class AppListItem extends StatelessWidget {
@@ -19,161 +20,96 @@ class AppListItem extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Consumer<AppProvider>(builder: (context, provider, child) {
-      return GestureDetector(
-        onTap: () async {
-          MixpanelManager().pageOpened('App Detail');
-          await routeToPage(context, AppDetailPage(app: app));
-          provider.setApps();
-        },
-        child: Container(
-          padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
-          margin: EdgeInsets.only(bottom: 12, top: index == 0 ? 24 : 0),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              CachedNetworkImage(
-                imageUrl: app.getImageUrl(),
-                httpHeaders: const {
-                  "User-Agent":
-                      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-                },
-                imageBuilder: (context, imageProvider) => Container(
-                  width: 48,
-                  height: 48,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.rectangle,
-                    borderRadius: BorderRadius.circular(8),
-                    image: DecorationImage(image: imageProvider, fit: BoxFit.cover),
+    return GestureDetector(
+      onTap: () => _openDetail(context),
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        margin: EdgeInsets.only(bottom: 8, top: index == 0 ? 16 : 0),
+        decoration: BoxDecoration(
+          color: OmiColors.surface1.withValues(alpha: 0.3),
+          borderRadius: OmiRadius.mdAll,
+        ),
+        child: Row(
+          children: [
+            // App icon
+            ClipRRect(
+              borderRadius: OmiRadius.mdAll,
+              child: Container(
+                width: 60,
+                height: 60,
+                decoration: BoxDecoration(color: OmiColors.surface2, borderRadius: OmiRadius.mdAll),
+                child: CachedNetworkImage(
+                  imageUrl: app.getImageUrl(),
+                  httpHeaders: const {
+                    "User-Agent":
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                  },
+                  fit: BoxFit.cover,
+                  placeholder: (context, url) => ShimmerWithTimeout(
+                    baseColor: OmiColors.surface1,
+                    highlightColor: OmiColors.surface2,
+                    child: Container(
+                      width: double.infinity,
+                      height: double.infinity,
+                      decoration: BoxDecoration(color: OmiColors.surface1, borderRadius: OmiRadius.mdAll),
+                    ),
                   ),
-                ),
-                placeholder: (context, url) => const SizedBox(
-                  width: 48,
-                  height: 48,
-                  child: CircularProgressIndicator(
-                    valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                  ),
-                ),
-                errorWidget: (context, url, error) => const SizedBox(
-                  width: 48,
-                  height: 48,
-                  child: Icon(
-                    Icons.error,
-                    color: Colors.white,
-                  ),
+                  errorWidget: (context, url, error) => Icon(Icons.apps, size: 30, color: OmiColors.textTertiary),
                 ),
               ),
-              const SizedBox(width: 14),
-              Expanded(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.start,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
+            ),
+
+            const SizedBox(width: 16),
+
+            // App details
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    app.name.decodeString + (app.private && showPrivateIcon ? " 🔒".decodeString : ''),
+                    style: OmiType.callout.copyWith(fontWeight: FontWeight.w500),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    app.description,
+                    style: OmiType.footnote.copyWith(color: OmiColors.textSecondary),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  if (app.ratingAvg != null) ...[
+                    const SizedBox(height: 4),
                     Row(
                       children: [
-                        ConstrainedBox(
-                          constraints: BoxConstraints(maxWidth: MediaQuery.sizeOf(context).width * 0.62),
-                          child: Text(
-                            app.name.decodeString + (app.private && showPrivateIcon ? " 🔒".decodeString : ''),
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(fontWeight: FontWeight.w500, color: Colors.white, fontSize: 16),
-                          ),
+                        const Icon(Icons.star_rounded, color: Colors.white, size: 14),
+                        const SizedBox(width: 4),
+                        Text(
+                          app.getRatingAvg()!,
+                          style: OmiType.footnote.copyWith(fontWeight: FontWeight.w500, color: OmiColors.textSecondary),
                         ),
-                      ],
-                    ),
-                    SizedBox(height: app.ratingAvg != null ? 4 : 0),
-                    Padding(
-                      padding: const EdgeInsets.only(top: 4.0),
-                      child: Text(
-                        app.description.decodeString,
-                        maxLines: 2,
-                        style: const TextStyle(color: Colors.grey, fontSize: 14),
-                      ),
-                    ),
-                    Row(
-                      children: [
-                        app.ratingAvg != null || app.installs > 0
-                            ? Padding(
-                                padding: const EdgeInsets.only(top: 8),
-                                child: Row(
-                                  crossAxisAlignment: CrossAxisAlignment.center,
-                                  mainAxisAlignment: MainAxisAlignment.start,
-                                  children: [
-                                    app.ratingAvg != null
-                                        ? Row(
-                                            crossAxisAlignment: CrossAxisAlignment.center,
-                                            children: [
-                                              Text(app.getRatingAvg()!),
-                                              const SizedBox(width: 4),
-                                              const Icon(Icons.star, color: Colors.deepPurple, size: 16),
-                                              const SizedBox(width: 4),
-                                              Text('(${app.ratingCount})'),
-                                              const SizedBox(width: 16),
-                                            ],
-                                          )
-                                        : const SizedBox(),
-                                  ],
-                                ),
-                              )
-                            : Container(),
-                        //app.isPaid
-                        //    ? Padding(
-                        //        padding: const EdgeInsets.only(top: 8),
-                        //        child: Text(
-                        //          app.getFormattedPrice(),
-                        //          style: TextStyle(color: Colors.grey.shade400, fontSize: 14),
-                        //        ),
-                        //      )
-                        //    : const SizedBox(),
+                        const SizedBox(width: 4),
+                        Text('(${app.ratingCount})', style: OmiType.footnote.copyWith(color: OmiColors.textTertiary)),
                       ],
                     ),
                   ],
-                ),
+                ],
               ),
-              SizedBox(width: MediaQuery.sizeOf(context).width * 0.02),
-              provider.appLoading.isNotEmpty && index != -1 && provider.appLoading[index]
-                  ? const Padding(
-                      padding: EdgeInsets.all(10),
-                      child: SizedBox(
-                        height: 24,
-                        width: 24,
-                        child: CircularProgressIndicator(
-                          valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                        ),
-                      ),
-                    )
-                  : IconButton(
-                      icon: Icon(
-                        app.enabled ? Icons.check : Icons.arrow_downward_rounded,
-                        color: app.enabled ? Colors.white : Colors.grey,
-                      ),
-                      onPressed: () {
-                        if (app.worksExternally() && !app.enabled) {
-                          showDialog(
-                            context: context,
-                            builder: (c) => getDialog(
-                              context,
-                              () => Navigator.pop(context),
-                              () async {
-                                Navigator.pop(context);
-                                await routeToPage(context, AppDetailPage(app: app));
-                                provider.setApps();
-                              },
-                              'Authorize External App',
-                              'Do you allow this app to access your memories, transcripts, and recordings? Your data will be sent to the app\'s server for processing.',
-                              okButtonText: 'Confirm',
-                            ),
-                          );
-                        } else {
-                          provider.toggleApp(app.id.toString(), !app.enabled, index);
-                        }
-                      },
-                    ),
-            ],
-          ),
+            ),
+
+            const SizedBox(width: 12),
+
+            // Action button
+            AppListActionButton(app: app, loadingIndex: index, onOpen: () => _openDetail(context)),
+          ],
         ),
-      );
-    });
+      ),
+    );
+  }
+
+  Future<void> _openDetail(BuildContext context) async {
+    PlatformManager.instance.analytics.pageOpened('App Detail');
+    await routeToPage(context, AppDetailPage(app: app));
   }
 }

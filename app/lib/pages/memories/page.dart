@@ -1,54 +1,42 @@
+import 'dart:async';
+
+import 'package:omi/utils/platform/platform_manager.dart';
 import 'package:flutter/material.dart';
+
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
+import 'package:provider/provider.dart';
+import 'package:omi/widgets/shimmer_with_timeout.dart';
+
+import 'package:omi/backend/http/api/knowledge_graph_api.dart';
 import 'package:omi/backend/schema/memory.dart';
 import 'package:omi/providers/home_provider.dart';
 import 'package:omi/providers/memories_provider.dart';
-import 'package:omi/utils/analytics/mixpanel.dart';
+import 'package:omi/ui/ui.dart';
+import 'package:omi/utils/l10n_extensions.dart';
+import 'package:omi/utils/other/temp.dart';
 import 'package:omi/utils/ui_guidelines.dart';
 import 'package:omi/widgets/extensions/functions.dart';
-import 'package:provider/provider.dart';
-import 'package:shimmer/shimmer.dart';
-
-import 'widgets/memory_edit_sheet.dart';
-import 'widgets/memory_item.dart';
 import 'widgets/memory_dialog.dart';
-import 'widgets/memory_review_sheet.dart';
+import 'widgets/memory_edit_sheet.dart';
+import 'widgets/memory_graph_page.dart';
+import 'widgets/memory_history_status_banner.dart';
+import 'widgets/memory_item.dart';
 import 'widgets/memory_management_sheet.dart';
-
-// Filter options for the dropdown
-enum FilterOption { interesting, system, all }
+import 'widgets/memories_load_error.dart';
 
 class MemoriesPage extends StatefulWidget {
-  const MemoriesPage({super.key});
+  const MemoriesPage({super.key, this.showMindMap = true, this.loadGraph = KnowledgeGraphApi.getKnowledgeGraph});
+
+  /// The live graph preview at the top. The graph needs a real canvas and network, so harnesses
+  /// that pump the page without them turn it off.
+  final bool showMindMap;
+
+  /// Where the graph preview loads from; harnesses pass a fixture.
+  @visibleForTesting
+  final Future<Map<String, dynamic>> Function() loadGraph;
 
   @override
   State<MemoriesPage> createState() => MemoriesPageState();
-}
-
-class _ReviewPromptHeaderDelegate extends SliverPersistentHeaderDelegate {
-  final double height;
-  final Widget child;
-
-  _ReviewPromptHeaderDelegate({
-    required this.height,
-    required this.child,
-  });
-
-  @override
-  double get minExtent => height;
-
-  @override
-  double get maxExtent => height;
-
-  @override
-  Widget build(BuildContext context, double shrinkOffset, bool overlapsContent) {
-    return SizedBox.expand(child: child);
-  }
-
-  @override
-  bool shouldRebuild(_ReviewPromptHeaderDelegate oldDelegate) {
-    return height != oldDelegate.height || child != oldDelegate.child;
-  }
 }
 
 class MemoriesPageState extends State<MemoriesPage> with AutomaticKeepAliveClientMixin {
@@ -56,15 +44,28 @@ class MemoriesPageState extends State<MemoriesPage> with AutomaticKeepAliveClien
   bool get wantKeepAlive => true;
 
   final TextEditingController _searchController = TextEditingController();
-  MemoryCategory? _selectedCategory;
   final ScrollController _scrollController = ScrollController();
 
-  // Filter options for the dropdown
-  // Default will be set in initState based on current date
-  late FilterOption _currentFilter;
+  bool _isInitialLoad = true;
+  String? _highlightedMemoryId;
+  Timer? _highlightTimer;
+
+  Future<void> _createMemory(MemoriesProvider provider) async {
+    final existingIds = provider.memories.map((m) => m.id).toSet();
+    final saved = await showMemoryDialog(context, provider);
+    if (!mounted || saved != true) return;
+    final added = provider.memories.where((m) => !existingIds.contains(m.id));
+    if (added.isEmpty) return;
+    _highlightTimer?.cancel();
+    setState(() => _highlightedMemoryId = added.last.id);
+    _highlightTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted) setState(() => _highlightedMemoryId = null);
+    });
+  }
 
   @override
   void dispose() {
+    _highlightTimer?.cancel();
     _searchController.dispose();
     _scrollController.dispose();
     super.dispose();
@@ -73,67 +74,101 @@ class MemoriesPageState extends State<MemoriesPage> with AutomaticKeepAliveClien
   @override
   void initState() {
     super.initState();
-    // Set default filter based on current date
-    final now = DateTime.now();
-    final cutoffDate = DateTime(2025, 5, 31);
-
-    if (now.isAfter(cutoffDate)) {
-      _currentFilter = FilterOption.interesting;
-    } else {
-      _currentFilter = FilterOption.all;
-    }
-
     (() async {
       final provider = context.read<MemoriesProvider>();
-      await provider.init();
-
-      // Apply the date-based default filter
-      _applyFilter(_currentFilter);
-
-      if (!mounted) return;
-      final unreviewedMemories = provider.unreviewed;
-      final home = context.read<HomeProvider>();
-      if (unreviewedMemories.isNotEmpty && home.selectedIndex == 2) {
-        _showReviewSheet(context, unreviewedMemories, provider);
+      try {
+        await provider.init();
+      } finally {
+        // Always leave the initial-load state, even if init() threw. Otherwise
+        // `provider.loading && _isInitialLoad` stays true and the page is stuck
+        // on the loading skeleton forever.
+        if (mounted) {
+          setState(() {
+            _isInitialLoad = false;
+          });
+        }
       }
     }).withPostFrameCallback();
   }
 
-  void _applyFilter(FilterOption option) {
-    final provider = context.read<MemoriesProvider>();
-    setState(() {
-      _currentFilter = option;
-
-      switch (option) {
-        case FilterOption.interesting:
-          _filterByCategory(MemoryCategory.interesting);
-          MixpanelManager().memoriesFiltered('interesting');
-          break;
-        case FilterOption.system:
-          _filterByCategory(MemoryCategory.system);
-          MixpanelManager().memoriesFiltered('system');
-          break;
-        case FilterOption.all:
-          _filterByCategory(null); // null means no category filter
-          MixpanelManager().memoriesFiltered('all');
-          break;
-      }
-    });
+  Widget _buildHeader(MemoriesProvider provider, {required bool loading}) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(OmiSpacing.md, OmiSpacing.sm, OmiSpacing.md, 10),
+      child: Row(
+        children: [
+          Expanded(
+            child: Consumer<HomeProvider>(
+              builder: (context, home, child) => OmiSearchField(
+                placeholder: context.l10n.searchMemories,
+                controller: _searchController,
+                focusNode: loading ? null : home.memoriesSearchFieldFocusNode,
+                onChanged: provider.setSearchQuery,
+                onCleared: () => PlatformManager.instance.analytics.memorySearchCleared(provider.memories.length),
+                onSubmitted: (value) {
+                  if (value.isNotEmpty) {
+                    PlatformManager.instance.analytics.memorySearched(value, provider.filteredMemories.length);
+                  }
+                },
+              ),
+            ),
+          ),
+          const SizedBox(width: OmiSpacing.xxs),
+          OmiIconButton.filled(
+            icon: const FaIcon(FontAwesomeIcons.sliders, size: 16),
+            label: context.l10n.memoryManagement,
+            diameter: 40,
+            onPressed: loading ? null : () => _showMemoryManagementSheet(context, provider),
+          ),
+        ],
+      ),
+    );
   }
 
-  void _filterByCategory(MemoryCategory? category) {
-    setState(() {
-      _selectedCategory = category;
-    });
-    context.read<MemoriesProvider>().setCategoryFilter(category);
-  }
+  /// The account has no memories at all (not a search or filter with no matches).
+  bool _showsFirstMemoryAction(MemoriesProvider provider) =>
+      !(provider.loading && _isInitialLoad) &&
+      !provider.showLoadError &&
+      provider.memories.isEmpty &&
+      provider.searchQuery.isEmpty &&
+      !provider.filterThisDeviceOnly;
 
-  Map<MemoryCategory, int> _getCategoryCounts(List<Memory> memories) {
-    var counts = <MemoryCategory, int>{};
-    for (var memory in memories) {
-      counts[memory.category] = (counts[memory.category] ?? 0) + 1;
-    }
-    return counts;
+  Widget _buildEmptyState(MemoriesProvider provider) {
+    final l10n = context.l10n;
+    final searching = provider.searchQuery.isNotEmpty;
+    final filtered = provider.memories.isNotEmpty || provider.filterThisDeviceOnly;
+    return KeyedSubtree(
+      key: const Key('memories_empty_state'),
+      child: OmiEmptyState(
+        icon: searching ? Icons.search_off_rounded : Icons.psychology_outlined,
+        title: searching
+            ? l10n.noMemoriesFound
+            : filtered
+                ? l10n.noMemoriesInCategories
+                : l10n.noMemoriesYet,
+        action: OmiButton(
+          key: const Key('memories_empty_action'),
+          variant: searching || filtered ? OmiButtonVariant.secondary : OmiButtonVariant.primary,
+          size: OmiButtonSize.compact,
+          label: searching
+              ? l10n.clearSearch
+              : filtered
+                  ? l10n.resetFilters
+                  : l10n.addFirstMemory,
+          onPressed: () {
+            if (searching) {
+              _searchController.clear();
+              provider.setSearchQuery('');
+            } else if (filtered) {
+              provider.clearCategoryFilter();
+              provider.setFilterThisDeviceOnly(false);
+              provider.setCollectionView(MemoryCollectionView.all);
+            } else {
+              _createMemory(provider);
+            }
+          },
+        ),
+      ),
+    );
   }
 
   @override
@@ -141,368 +176,106 @@ class MemoriesPageState extends State<MemoriesPage> with AutomaticKeepAliveClien
     super.build(context);
     return Consumer<MemoriesProvider>(
       builder: (context, provider, _) {
-        return PopScope(
-          canPop: true,
-          child: Scaffold(
-            backgroundColor: Theme.of(context).colorScheme.primary,
-            body: provider.loading
-                ? NestedScrollView(
-                    headerSliverBuilder: (context, innerBoxIsScrolled) {
-                      return [
-                        SliverToBoxAdapter(
-                          child: Padding(
-                            padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
-                            child: Row(
-                              children: [
-                                Expanded(
-                                  child: SizedBox(
-                                    height: 44,
-                                    child: SearchBar(
-                                      hintText: 'Search memories',
-                                      leading: const Padding(
-                                        padding: EdgeInsets.only(left: 6.0),
-                                        child: Icon(FontAwesomeIcons.magnifyingGlass, color: Colors.white70, size: 14),
-                                      ),
-                                      backgroundColor: WidgetStateProperty.all(AppStyles.backgroundSecondary),
-                                      elevation: WidgetStateProperty.all(0),
-                                      padding: WidgetStateProperty.all(
-                                        const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                                      ),
-                                      hintStyle: WidgetStateProperty.all(
-                                        TextStyle(color: AppStyles.textTertiary, fontSize: 14),
-                                      ),
-                                      textStyle: WidgetStateProperty.all(
-                                        TextStyle(color: AppStyles.textPrimary, fontSize: 14),
-                                      ),
-                                      shape: WidgetStateProperty.all(
-                                        RoundedRectangleBorder(
-                                          borderRadius: BorderRadius.circular(AppStyles.radiusLarge),
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                                const SizedBox(width: 8),
-                                SizedBox(
-                                  width: 44,
-                                  height: 44,
-                                  child: _buildShimmerButton(),
-                                ),
-                                const SizedBox(width: 8),
-                                SizedBox(
-                                  width: 44,
-                                  height: 44,
-                                  child: _buildShimmerButton(),
-                                ),
-                                const SizedBox(width: 8),
-                                SizedBox(
-                                  width: 44,
-                                  height: 44,
-                                  child: _buildShimmerButton(),
-                                ),
-                              ],
+        return Scaffold(
+          backgroundColor: OmiColors.surface0,
+          appBar: AppBar(leading: const OmiBackButton(), title: Text(context.l10n.memories)),
+          body: Stack(
+            children: [
+              RefreshIndicator(
+                onRefresh: () async {
+                  OmiHaptics.medium();
+                  await provider.init();
+                },
+                child: provider.loading && _isInitialLoad
+                    ? CustomScrollView(
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        slivers: [
+                          SliverToBoxAdapter(child: _buildHeader(provider, loading: true)),
+                          SliverFillRemaining(child: _buildShimmerMemoryList()),
+                        ],
+                      )
+                    : CustomScrollView(
+                        controller: _scrollController,
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        slivers: [
+                          // The mind map leads the page (it moved here from Home); tap to expand.
+                          if (widget.showMindMap && provider.searchQuery.isEmpty && provider.memories.isNotEmpty)
+                            SliverToBoxAdapter(child: MemoryMindMapPreview(loadGraph: widget.loadGraph)),
+                          SliverToBoxAdapter(child: _buildHeader(provider, loading: false)),
+                          if (provider.showPartialLoadError)
+                            SliverToBoxAdapter(
+                              child: MemoriesPartialLoadBanner(onRetry: () => provider.loadMemories()),
                             ),
-                          ),
-                        ),
-                      ];
-                    },
-                    body: _buildShimmerMemoryList(),
-                  )
-                : NestedScrollView(
-                    controller: _scrollController,
-                    headerSliverBuilder: (context, innerBoxIsScrolled) {
-                      return [
-                        SliverToBoxAdapter(
-                          child: Padding(
-                            padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
-                            child: Row(
-                              children: [
-                                Consumer<HomeProvider>(builder: (context, home, child) {
-                                  return Expanded(
-                                    child: SizedBox(
-                                      height: 44,
-                                      child: SearchBar(
-                                        hintText: 'Search memories',
-                                        leading: const Padding(
-                                          padding: EdgeInsets.only(left: 6.0),
-                                          child: Icon(FontAwesomeIcons.magnifyingGlass, color: Colors.white70, size: 14),
-                                        ),
-                                        backgroundColor: WidgetStateProperty.all(AppStyles.backgroundSecondary),
-                                        elevation: WidgetStateProperty.all(0),
-                                        padding: WidgetStateProperty.all(
-                                          const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                                        ),
-                                        focusNode: home.memoriesSearchFieldFocusNode,
-                                        controller: _searchController,
-                                        trailing: provider.searchQuery.isNotEmpty
-                                            ? [
-                                                IconButton(
-                                                  icon: const Icon(Icons.close, color: Colors.white70, size: 16),
-                                                  padding: EdgeInsets.zero,
-                                                  constraints: const BoxConstraints(
-                                                    minHeight: 36,
-                                                    minWidth: 36,
-                                                  ),
-                                                  onPressed: () {
-                                                    _searchController.clear();
-                                                    provider.setSearchQuery('');
-                                                    MixpanelManager().memorySearchCleared(provider.memories.length);
-                                                  },
-                                                )
-                                              ]
-                                            : null,
-                                        hintStyle: WidgetStateProperty.all(
-                                          TextStyle(color: AppStyles.textTertiary, fontSize: 14),
-                                        ),
-                                        textStyle: WidgetStateProperty.all(
-                                          TextStyle(color: AppStyles.textPrimary, fontSize: 14),
-                                        ),
-                                        shape: WidgetStateProperty.all(
-                                          RoundedRectangleBorder(
-                                            borderRadius: BorderRadius.circular(AppStyles.radiusLarge),
-                                          ),
-                                        ),
-                                        onChanged: (value) => provider.setSearchQuery(value),
-                                        onSubmitted: (value) {
-                                          if (value.isNotEmpty) {
-                                            MixpanelManager().memorySearched(value, provider.filteredMemories.length);
-                                          }
-                                        },
-                                      ),
-                                    ),
-                                  );
-                                }),
-                                const SizedBox(width: 8),
-                                SizedBox(
-                                  width: 44,
-                                  height: 44,
-                                  child: PopupMenuButton<FilterOption>(
-                                    onSelected: _applyFilter,
-                                    shape: RoundedRectangleBorder(
-                                      borderRadius: BorderRadius.circular(12),
-                                    ),
-                                    color: AppStyles.backgroundSecondary,
-                                    offset: const Offset(0, 8),
-                                    elevation: 4,
-                                    tooltip: 'Filter memories by category',
-                                    position: PopupMenuPosition.under,
-                                    itemBuilder: (BuildContext context) => <PopupMenuEntry<FilterOption>>[
-                                      PopupMenuItem<FilterOption>(
-                                        value: FilterOption.all,
-                                        child: Row(
-                                          children: [
-                                            const Text(
-                                              'All',
-                                              style: TextStyle(color: Colors.white),
-                                            ),
-                                            const Spacer(),
-                                            if (_currentFilter == FilterOption.all) const Icon(Icons.check, size: 16, color: Colors.white),
-                                          ],
-                                        ),
-                                      ),
-                                      PopupMenuItem<FilterOption>(
-                                        value: FilterOption.interesting,
-                                        child: Row(
-                                          children: [
-                                            const Text(
-                                              'Interesting',
-                                              style: TextStyle(color: Colors.white),
-                                            ),
-                                            const Spacer(),
-                                            if (_currentFilter == FilterOption.interesting) const Icon(Icons.check, size: 16, color: Colors.white),
-                                          ],
-                                        ),
-                                      ),
-                                      PopupMenuItem<FilterOption>(
-                                        value: FilterOption.system,
-                                        child: Row(
-                                          children: [
-                                            const Text(
-                                              'System',
-                                              style: TextStyle(color: Colors.white),
-                                            ),
-                                            const Spacer(),
-                                            if (_currentFilter == FilterOption.system) const Icon(Icons.check, size: 16, color: Colors.white),
-                                          ],
-                                        ),
-                                      ),
-                                    ],
-                                    child: Container(
-                                      decoration: BoxDecoration(
-                                        color: AppStyles.backgroundSecondary,
-                                        borderRadius: BorderRadius.circular(12),
-                                      ),
-                                      child: const Center(
-                                        child: Icon(
-                                          FontAwesomeIcons.filter,
-                                          size: 16,
-                                          color: Colors.white,
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                                const SizedBox(width: 8),
-                                SizedBox(
-                                  width: 44,
-                                  height: 44,
-                                  child: ElevatedButton(
-                                    onPressed: () {
-                                      _showMemoryManagementSheet(context, provider);
-                                    },
-                                    style: ElevatedButton.styleFrom(
-                                      backgroundColor: AppStyles.backgroundSecondary,
-                                      foregroundColor: Colors.white,
-                                      padding: EdgeInsets.zero,
-                                      shape: RoundedRectangleBorder(
-                                        borderRadius: BorderRadius.circular(12),
-                                      ),
-                                    ),
-                                    child: const Icon(FontAwesomeIcons.sliders, size: 16),
-                                  ),
-                                ),
-                                const SizedBox(width: 8),
-                                SizedBox(
-                                  width: 44,
-                                  height: 44,
-                                  child: ElevatedButton(
-                                    onPressed: () {
-                                      showMemoryDialog(context, provider);
-                                      MixpanelManager().memoriesPageCreateMemoryBtn();
-                                    },
-                                    style: ElevatedButton.styleFrom(
-                                      backgroundColor: AppStyles.backgroundSecondary,
-                                      foregroundColor: Colors.white,
-                                      padding: EdgeInsets.zero,
-                                      shape: RoundedRectangleBorder(
-                                        borderRadius: BorderRadius.circular(12),
-                                      ),
-                                    ),
-                                    child: const Icon(FontAwesomeIcons.plus, size: 18),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                        if (provider.unreviewed.isNotEmpty)
-                          SliverPersistentHeader(
-                            pinned: true,
-                            floating: true,
-                            delegate: _ReviewPromptHeaderDelegate(
-                              height: 56.0,
-                              child: Material(
-                                color: Theme.of(context).colorScheme.surfaceVariant,
-                                elevation: 1,
-                                child: InkWell(
-                                  onTap: () => _showReviewSheet(context, provider.unreviewed, provider),
-                                  child: Padding(
-                                    padding: const EdgeInsets.symmetric(horizontal: 16.0),
-                                    child: Row(
-                                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                      children: [
-                                        Expanded(
-                                          child: Row(
-                                            children: [
-                                              Icon(FontAwesomeIcons.listCheck, color: Theme.of(context).colorScheme.onSurfaceVariant, size: 18),
-                                              const SizedBox(width: 12),
-                                              Flexible(
-                                                child: Text(
-                                                  '${provider.unreviewed.length} ${provider.unreviewed.length == 1 ? "memory" : "memories"} to review',
-                                                  style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant, fontWeight: FontWeight.w500),
-                                                  overflow: TextOverflow.ellipsis,
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                        ),
-                                        Padding(
-                                          padding: const EdgeInsets.only(left: 8.0),
-                                          child: Text('Review', style: TextStyle(color: Theme.of(context).colorScheme.primary, fontWeight: FontWeight.bold)),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
+                          if (provider.memoryBeliefEnabled &&
+                              provider.showHistory &&
+                              (provider.ledgerHistoryTruncated || provider.ledgerHistoryHasMore))
+                            SliverToBoxAdapter(
+                              child: Padding(
+                                padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                                child: MemoryHistoryStatusBanner(
+                                  onLoadMore: provider.ledgerHistoryHasMore ? provider.loadMoreHistory : null,
                                 ),
                               ),
                             ),
-                          ),
-                        SliverPersistentHeader(
-                          pinned: true,
-                          floating: true,
-                          delegate: _SliverSearchBarDelegate(
-                            minHeight: 0,
-                            maxHeight: 0,
-                            child: Container(),
-                          ),
-                        ),
-                      ];
-                    },
-                    body: provider.filteredMemories.isEmpty
-                        ? Center(
-                            child: Column(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                Icon(Icons.note_add, size: 48, color: Colors.grey.shade600),
-                                const SizedBox(height: 16),
-                                Text(
-                                  provider.searchQuery.isEmpty && _selectedCategory == null
-                                      ? 'No memories yet'
-                                      : _selectedCategory != null
-                                          ? _selectedCategory == MemoryCategory.interesting
-                                              ? 'No interesting memories yet'
-                                              : _selectedCategory == MemoryCategory.system
-                                                  ? 'No system memories yet'
-                                                  : 'No memories in this category'
-                                          : 'No memories found',
-                                  style: TextStyle(
-                                    color: Colors.grey.shade400,
-                                    fontSize: 18,
-                                  ),
-                                ),
-                                if (provider.searchQuery.isEmpty && _selectedCategory == null) ...[
-                                  const SizedBox(height: 8),
-                                  TextButton(
-                                    onPressed: () => showMemoryDialog(context, provider),
-                                    child: const Text('Add your first memory'),
-                                  ),
-                                ],
-                              ],
+                          if (provider.showLoadError || provider.filteredMemories.isEmpty)
+                            SliverFillRemaining(
+                              hasScrollBody: false,
+                              child: MemoriesEmptyOrError(
+                                showLoadError: provider.showLoadError,
+                                onRetry: () => provider.loadMemories(),
+                                emptyState: _buildEmptyState(provider),
+                              ),
+                            )
+                          else
+                            SliverPadding(
+                              padding: const EdgeInsets.only(top: 8, left: 16, right: 16, bottom: 120),
+                              sliver: SliverList(
+                                delegate: SliverChildBuilderDelegate((context, index) {
+                                  final memory = provider.filteredMemories[index];
+                                  return MemoryItem(
+                                    memory: memory,
+                                    highlighted: memory.id == _highlightedMemoryId,
+                                    provider: provider,
+                                    onTap:
+                                        (BuildContext context, Memory tappedMemory, MemoriesProvider tappedProvider) {
+                                      PlatformManager.instance.analytics.memoryListItemClicked(tappedMemory);
+                                      _showQuickEditSheet(context, tappedMemory, tappedProvider);
+                                    },
+                                  );
+                                }, childCount: provider.filteredMemories.length),
+                              ),
                             ),
-                          )
-                        : ListView.builder(
-                            // Add significant bottom padding to prevent content from being covered by floating action bar
-                            padding: const EdgeInsets.only(top: 8, left: 16, right: 16, bottom: 120),
-                            itemCount: provider.filteredMemories.length,
-                            itemBuilder: (context, index) {
-                              final memory = provider.filteredMemories[index];
-                              return MemoryItem(
-                                memory: memory,
-                                provider: provider,
-                                onTap: (BuildContext context, Memory tappedMemory, MemoriesProvider tappedProvider) {
-                                  MixpanelManager().memoryListItemClicked(tappedMemory);
-                                  _showQuickEditSheet(context, tappedMemory, tappedProvider);
-                                },
-                              );
-                            },
-                          ),
+                        ],
+                      ),
+              ),
+              // The empty state's "Add your first memory" is how the page gets its first row (ux-contract
+              // §13: one action), so the add button joins once there is a memory.
+              if (!_showsFirstMemoryAction(provider))
+                Positioned(
+                  right: 20,
+                  bottom: 100,
+                  // One named node: FloatingActionButton's tooltip names a wrapper, not the button.
+                  child: Semantics(
+                    button: true,
+                    label: context.l10n.createMemoryTooltip,
+                    excludeSemantics: true,
+                    onTap: () => _createMemory(provider),
+                    child: FloatingActionButton(
+                      heroTag: 'memories_fab',
+                      onPressed: () {
+                        _createMemory(provider);
+                        PlatformManager.instance.analytics.memoriesPageCreateMemoryBtn();
+                      },
+                      backgroundColor: OmiColors.accent,
+                      foregroundColor: OmiColors.onAccent,
+                      child: const Icon(Icons.add),
+                    ),
                   ),
+                ),
+            ],
           ),
         );
       },
-    );
-  }
-
-  Widget _buildShimmerButton() {
-    return Shimmer.fromColors(
-      baseColor: AppStyles.backgroundSecondary,
-      highlightColor: AppStyles.backgroundTertiary,
-      child: Container(
-        decoration: BoxDecoration(
-          color: AppStyles.backgroundSecondary,
-          borderRadius: BorderRadius.circular(12),
-        ),
-      ),
     );
   }
 
@@ -512,16 +285,13 @@ class MemoriesPageState extends State<MemoriesPage> with AutomaticKeepAliveClien
       child: ListView.builder(
         itemCount: 8, // Show 8 shimmer items
         itemBuilder: (context, index) {
-          return Shimmer.fromColors(
-            baseColor: AppStyles.backgroundSecondary,
-            highlightColor: AppStyles.backgroundTertiary,
+          return ShimmerWithTimeout(
+            baseColor: OmiColors.surface1,
+            highlightColor: OmiColors.surface3,
             child: Container(
               margin: const EdgeInsets.only(bottom: AppStyles.spacingM),
               height: 88, // Approximate height of a memory item
-              decoration: BoxDecoration(
-                color: AppStyles.backgroundSecondary,
-                borderRadius: BorderRadius.circular(AppStyles.radiusLarge),
-              ),
+              decoration: BoxDecoration(color: OmiColors.surface1, borderRadius: OmiRadius.mdAll),
             ),
           );
         },
@@ -530,125 +300,48 @@ class MemoriesPageState extends State<MemoriesPage> with AutomaticKeepAliveClien
   }
 
   void _showQuickEditSheet(BuildContext context, Memory memory, MemoriesProvider provider) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: Colors.transparent,
-      isScrollControlled: true,
-      builder: (context) => MemoryEditSheet(
-        memory: memory,
-        provider: provider,
-        onDelete: (_, __, ___) {},
-      ),
-    );
+    showMemoryQuickEditSheet(context, memory, provider);
   }
 
-  void _showReviewSheet(BuildContext context, List<Memory> memories, MemoriesProvider existingProvider) async {
-    if (memories.isEmpty || !mounted) return;
-    await showModalBottomSheet(
-      context: context,
-      backgroundColor: Colors.transparent,
-      isDismissible: true,
-      enableDrag: false,
-      isScrollControlled: true,
-      builder: (sheetContext) {
-        return ChangeNotifierProvider.value(
-          value: existingProvider,
-          child: MemoriesReviewSheet(
-            memories: memories,
-            provider: existingProvider,
-          ),
-        );
-      },
-    );
-  }
-
-  void _showDeleteAllConfirmation(BuildContext context, MemoriesProvider provider) {
-    if (provider.memories.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('No memories to delete'),
-          duration: Duration(seconds: 2),
-        ),
-      );
-      return;
+  void scrollToTop() {
+    if (_scrollController.hasClients) {
+      _scrollController.animateTo(0.0, duration: OmiMotion.emphasizedDuration, curve: OmiMotion.emphasizedCurve);
     }
-
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: Colors.grey.shade900,
-        title: const Text(
-          'Clear Omi\'s Memory',
-          style: TextStyle(color: Colors.white),
-        ),
-        content: Text(
-          'Are you sure you want to clear Omi\'s memory? This action cannot be undone.',
-          style: TextStyle(color: Colors.grey.shade300),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: Text(
-              'Cancel',
-              style: TextStyle(color: Colors.grey.shade400),
-            ),
-          ),
-          TextButton(
-            onPressed: () {
-              provider.deleteAllMemories();
-              Navigator.pop(context);
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text('Omi\'s memory about you has been cleared'),
-                  duration: Duration(seconds: 2),
-                ),
-              );
-            },
-            child: const Text(
-              'Clear Memory',
-              style: TextStyle(color: Colors.red),
-            ),
-          ),
-        ],
-      ),
-    );
   }
 
   void _showMemoryManagementSheet(BuildContext context, MemoriesProvider provider) {
-    MixpanelManager().memoriesManagementSheetOpened();
-    showModalBottomSheet(
+    PlatformManager.instance.analytics.memoriesManagementSheetOpened();
+    showOmiSheet<void>(
       context: context,
-      backgroundColor: Colors.transparent,
-      isScrollControlled: true,
+      title: context.l10n.memoryManagement,
+      padding: EdgeInsets.zero,
       builder: (context) => MemoryManagementSheet(provider: provider),
     );
   }
 }
 
-class _SliverSearchBarDelegate extends SliverPersistentHeaderDelegate {
-  final double minHeight;
-  final double maxHeight;
-  final Widget child;
+/// The mind map preview at the top of Memories: a compact skeleton while the graph loads, a
+/// zoomed-out, non-interactive graph that opens the full graph on tap, or one Try Again row when
+/// it fails. It loads on its own; the list below never waits on it.
+class MemoryMindMapPreview extends StatelessWidget {
+  const MemoryMindMapPreview({super.key, this.loadGraph = KnowledgeGraphApi.getKnowledgeGraph});
 
-  _SliverSearchBarDelegate({
-    required this.minHeight,
-    required this.maxHeight,
-    required this.child,
-  });
+  final Future<Map<String, dynamic>> Function() loadGraph;
 
   @override
-  double get minExtent => minHeight;
-
-  @override
-  double get maxExtent => maxHeight;
-
-  @override
-  Widget build(BuildContext context, double shrinkOffset, bool overlapsContent) {
-    return SizedBox.expand(child: child);
-  }
-
-  @override
-  bool shouldRebuild(_SliverSearchBarDelegate oldDelegate) {
-    return maxHeight != oldDelegate.maxHeight || minHeight != oldDelegate.minHeight || child != oldDelegate.child;
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+      child: MemoryGraphPage(
+        embedded: true,
+        preview: true,
+        showAppBar: false,
+        showShareButton: false,
+        trackOpenEvent: false,
+        initialZoom: 0.6,
+        loadGraph: loadGraph,
+        onOpen: () => routeToPage(context, const MemoryGraphPage(trackOpenEvent: false)),
+      ),
+    );
   }
 }

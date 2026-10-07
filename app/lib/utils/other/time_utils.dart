@@ -1,71 +1,18 @@
-String secondsToHumanReadable(int seconds) {
-  if (seconds < 60) {
-    return '$seconds secs';
-  } else if (seconds < 3600) {
-    var minutes = (seconds / 60).floor();
-    var remainingSeconds = seconds % 60;
-    if (remainingSeconds == 0) {
-      if (minutes == 1) {
-        return '$minutes min';
-      }
-      return '$minutes mins';
-    } else {
-      return '$minutes mins $remainingSeconds secs';
-    }
-  } else if (seconds < 86400) {
-    var hours = (seconds / 3600).floor();
-    var remainingMinutes = (seconds % 3600 / 60).floor();
-    if (remainingMinutes == 0) {
-      if (hours == 1) {
-        return '$hours hour';
-      }
-      return '$hours hours';
-    } else {
-      return '$hours hours $remainingMinutes mins';
-    }
-  } else {
-    var days = (seconds / 86400).floor();
-    var remainingHours = (seconds % 86400 / 3600).floor();
-    if (remainingHours == 0) {
-      if (days == 1) {
-        return '$days day';
-      }
-      return '$days days';
-    } else {
-      return '$days days $remainingHours hours';
-    }
-  }
-}
+import 'package:flutter/widgets.dart';
 
-/// Returns a compact representation of seconds (e.g., "10s", "5m", "2h 15m")
-/// Designed for use in small UI elements like list items
-String secondsToCompactDuration(int seconds) {
-  if (seconds < 60) {
-    return '${seconds}s';
-  } else if (seconds < 3600) {
-    var minutes = (seconds / 60).floor();
-    var remainingSeconds = seconds % 60;
-    if (remainingSeconds == 0 || minutes >= 10) {
-      return '${minutes}m';
-    } else {
-      // Only show seconds for durations less than 10 minutes
-      return '${minutes}m ${remainingSeconds}s';
-    }
-  } else {
-    var hours = (seconds / 3600).floor();
-    var remainingMinutes = (seconds % 3600 / 60).floor();
-    if (remainingMinutes == 0 || hours >= 10) {
-      return '${hours}h';
-    } else {
-      return '${hours}h ${remainingMinutes}m';
-    }
-  }
-}
+import 'package:omi/l10n/app_localizations.dart';
+import 'package:omi/ui/format/omi_duration.dart';
 
-// convert seconds to hh:mm:ss format
-String secondsToHMS(int seconds) {
-  var hours = (seconds / 3600).floor();
-  var minutes = (seconds % 3600 / 60).floor();
-  var remainingSeconds = seconds % 60;
-  return '$hours:$minutes:$remainingSeconds';
-}
+/// Spelled-out length ("12 mins 34 secs"). Delegates to [OmiDuration.long]; new code calls that
+/// (and uses [OmiDuration.compact] for lengths shown in rows and details).
+String secondsToHumanReadable(int seconds, [BuildContext? context]) =>
+    OmiDuration.long(seconds, context != null ? AppLocalizations.of(context) : null);
+
+/// Compact length ("10s", "5m", "2h 15m"). Delegates to [OmiDuration.compact]; new code calls that.
+String secondsToCompactDuration(int seconds, [BuildContext? context]) =>
+    OmiDuration.compact(seconds, context != null ? AppLocalizations.of(context) : null);
+
+/// Clock-style position ("3:38", "1:02:05"). Delegates to [OmiDuration.offset].
+///
+/// It used to print unpadded `h:m:s` ("0:3:8"); it has no callers that depend on that shape.
+String secondsToHMS(int seconds) => OmiDuration.offset(seconds);

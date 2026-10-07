@@ -1,72 +1,56 @@
-import 'dart:io';
-
-import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
-import 'package:omi/main.dart';
 
+import 'package:omi/app_globals.dart';
+import 'package:omi/ui/feedback/omi_dialogs.dart';
+import 'package:omi/utils/l10n_extensions.dart';
+
+/// Legacy context-free adapter over [OmiAlertDialog], for providers and services that only have
+/// the global navigator. Code with a `BuildContext` calls `showOmiConfirm` / `showOmiAlert`.
+///
+/// Every button closes the dialog after running its callback. With [singleButton] the dialog is an
+/// information alert: one [okButtonText] (default OK) that runs [onCancel].
 class AppDialog {
-  static _getDialog({
-    required BuildContext context,
-    required String title,
-    required String content,
-    Function? onConfirm,
-    Function? onCancel,
-    bool singleButton = false,
-    String okButtonText = 'Ok',
-  }) {
-    var actions = singleButton
-        ? [
-            TextButton(
-              onPressed: () => onCancel?.call() ?? Navigator.pop(context),
-              child: Text(okButtonText, style: const TextStyle(color: Colors.white)),
-            )
-          ]
-        : [
-            TextButton(
-              onPressed: () => onCancel?.call() ?? Navigator.pop(context),
-              child: const Text('Cancel', style: TextStyle(color: Colors.white)),
-            ),
-            TextButton(
-              onPressed: () => onConfirm?.call() ?? Navigator.pop(context),
-              child: Text(
-                okButtonText,
-                style: const TextStyle(
-                  color: Colors.white,
-                ),
-              ),
-            ),
-          ];
-    if (Platform.isIOS) {
-      return CupertinoAlertDialog(
-        title: Text(title),
-        content: Text(content),
-        actions: actions,
-      );
-    }
-    return AlertDialog(
-      title: Text(title),
-      content: Text(content),
-      actions: actions,
-    );
-  }
-
   static void show({
     required String title,
     required String content,
     Function? onConfirm,
     Function? onCancel,
     bool singleButton = false,
-    String okButtonText = 'Ok',
+    String? okButtonText,
+    bool destructive = false,
   }) {
+    final state = globalNavigatorKey.currentState;
+    if (state == null || state.overlay == null) return;
     showDialog(
-      context: MyApp.navigatorKey.currentState!.overlay!.context,
-      builder: (c) => _getDialog(
-        context: MyApp.navigatorKey.currentState!.context,
-        onConfirm: onConfirm,
-        title: title,
-        content: content,
-        okButtonText: okButtonText,
-      ),
+      context: state.overlay!.context,
+      builder: (dialogContext) {
+        void run(Function? callback) {
+          final route = ModalRoute.of(dialogContext);
+          callback?.call();
+          if (dialogContext.mounted && route != null && route.isCurrent) Navigator.of(dialogContext).pop();
+        }
+
+        final okText = okButtonText ?? dialogContext.l10n.ok;
+        return OmiAlertDialog(
+          title: title,
+          message: content,
+          actions: singleButton
+              ? [OmiDialogAction(label: okText, isDefault: true, onPressed: () => run(onCancel))]
+              : [
+                  OmiDialogAction(
+                    label: dialogContext.l10n.cancel,
+                    isDefault: destructive,
+                    onPressed: () => run(onCancel),
+                  ),
+                  OmiDialogAction(
+                    label: okText,
+                    isDestructive: destructive,
+                    isDefault: !destructive,
+                    onPressed: () => run(onConfirm),
+                  ),
+                ],
+        );
+      },
     );
   }
 }

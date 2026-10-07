@@ -1,503 +1,199 @@
-import datetime
+"""
+Chat routing — dispatches every turn to the agentic path.
+
+Replaces the previous LangGraph state machine with a simple async router.
+Claude decides implicitly whether to use tools, eliminating the need for
+the requires_context() LLM classification call.
+"""
+
+from __future__ import annotations
+
 import uuid
 import asyncio
-from typing import List, Optional, Tuple, AsyncGenerator
+from typing import List, Optional, AsyncGenerator, Tuple, Any, Dict, TYPE_CHECKING
 
-from langchain.callbacks.base import BaseCallbackHandler
-from langchain_core.messages import SystemMessage, AIMessage, HumanMessage
-from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.constants import END
-from langgraph.graph import START, StateGraph
-from typing_extensions import TypedDict, Literal
-# import os
-# os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = '../../' + os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
-import database.conversations as conversations_db
-from database.redis_db import get_filter_category_items
-from database.vector_db import query_vectors_by_metadata
-import database.notifications as notification_db
+if TYPE_CHECKING:
+    from models.conversation import Conversation
+
+from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, BaseMessage
+
 from models.app import App
-from models.chat import ChatSession, Message
-from models.conversation import Conversation
-from utils.llm.chat import (
-    answer_omi_question,
-    answer_omi_question_stream,
-    requires_context,
-    answer_simple_message,
-    answer_simple_message_stream,
-    retrieve_context_dates_by_question,
-    qa_rag,
-    qa_rag_stream,
-    retrieve_is_an_omi_question,
-    retrieve_is_file_question,
-    select_structured_filters,
-    extract_question_from_conversation,
+from models.chat import ChatSession, Message, PageContext
+from utils.journey_metrics_contract import ClientKind
+from utils.llm.chat import get_current_datetime_block, get_user_timezone
+from utils.llm.clients import get_llm
+from utils.llm.usage_tracker import Features, track_usage
+from utils.executors import db_executor, run_blocking
+from utils.retrieval.agentic import (
+    AGENT_STREAM_FAILURE_MESSAGE,
+    AGENT_STREAM_FIRST_EVENT_TIMEOUT_SECONDS,
+    AGENT_STREAM_MAX_DURATION_SECONDS,
+    AGENT_STREAM_PROGRESS_HEARTBEAT,
+    AGENT_STREAM_PROGRESS_HEARTBEAT_SECONDS,
+    AGENT_STREAM_SETUP_TIMEOUT_SECONDS,
+    AGENT_STREAM_TIMEOUT_MESSAGE,
+    AsyncStreamingCallback,
+    cancel_stream_task,
+    execute_agentic_chat_stream,
+    get_mobile_city,
+    next_stream_chunk,
 )
-from utils.llm.persona import answer_persona_question_stream
-from utils.other.chat_file import FileChatTool
-from utils.other.endpoints import timeit
-from utils.app_integrations import get_github_docs_content
-
-model = ChatOpenAI(model="gpt-4o-mini")
-llm_medium_stream = ChatOpenAI(model='gpt-4o', streaming=True)
-
-
-class StructuredFilters(TypedDict):
-    topics: List[str]
-    people: List[str]
-    entities: List[str]
-    dates: List[datetime.date]
-
-
-class DateRangeFilters(TypedDict):
-    start: datetime.datetime
-    end: datetime.datetime
-
-
-class AsyncStreamingCallback(BaseCallbackHandler):
-    def __init__(self):
-        self.queue = asyncio.Queue()
-
-    async def put_data(self, text):
-        await self.queue.put(f"data: {text}")
-
-    async def put_thought(self, text):
-        await self.queue.put(f"think: {text}")
-
-    def put_thought_nowait(self, text):
-        self.queue.put_nowait(f"think: {text}")
-
-    async def end(self):
-        await self.queue.put(None)
-
-    async def on_llm_new_token(self, token: str, **kwargs) -> None:
-        await self.put_data(token)
-
-    async def on_llm_end(self, response, **kwargs) -> None:
-        await self.end()
-
-    async def on_llm_error(self, error: Exception, **kwargs) -> None:
-        print(f"Error on LLM {error}")
-        await self.end()
-
-    def put_data_nowait(self, text):
-        self.queue.put_nowait(f"data: {text}")
-
-    def end_nowait(self):
-        self.queue.put_nowait(None)
-
-
-class GraphState(TypedDict):
-    uid: str
-    messages: List[Message]
-    plugin_selected: Optional[App]
-    tz: str
-    cited: Optional[bool] = False
-
-    streaming: Optional[bool] = False
-    callback: Optional[AsyncStreamingCallback] = None
-
-    filters: Optional[StructuredFilters]
-    date_filters: Optional[DateRangeFilters]
-
-    memories_found: Optional[List[Conversation]]
-
-    parsed_question: Optional[str]
-    answer: Optional[str]
-    ask_for_nps: Optional[bool]
-
-    chat_session: Optional[ChatSession]
-
-
-def determine_conversation(state: GraphState):
-    print("determine_conversation")
-    question = extract_question_from_conversation(state.get("messages", []))
-    print("determine_conversation parsed question:", question)
-
-    # # stream
-    # if state.get('streaming', False):
-    #     state['callback'].put_thought_nowait(question)
-
-    return {"parsed_question": question}
-
-
-def determine_conversation_type(
-        state: GraphState,
-) -> Literal[
-    "no_context_conversation", "context_dependent_conversation", "omi_question", "file_chat_question", "persona_question"]:
-    # chat with files by attachments on the last message
-    print("determine_conversation_type")
-    messages = state.get("messages", [])
-    if len(messages) > 0 and len(messages[-1].files_id) > 0:
-        return "file_chat_question"
-
-    # persona
-    app: App = state.get("plugin_selected")
-    if app and app.is_a_persona():
-        # file
-        question = state.get("parsed_question", "")
-        is_file_question = retrieve_is_file_question(question)
-        if is_file_question:
-            return "file_chat_question"
-
-        return "persona_question"
-
-    # chat
-    # no context
-    question = state.get("parsed_question", "")
-    if not question or len(question) == 0:
-        return "no_context_conversation"
-
-    # determine the follow-up question is chatting with files or not
-    is_file_question = retrieve_is_file_question(question)
-    if is_file_question:
-        return "file_chat_question"
-
-    is_omi_question = retrieve_is_an_omi_question(question)
-    if is_omi_question:
-        return "omi_question"
-
-    requires = requires_context(question)
-    if requires:
-        return "context_dependent_conversation"
-    return "no_context_conversation"
-
-
-def no_context_conversation(state: GraphState):
-    print("no_context_conversation node")
-
-    # streaming
-    streaming = state.get("streaming")
-    if streaming:
-        # state['callback'].put_thought_nowait("Reasoning")
-        answer: str = answer_simple_message_stream(
-            state.get("uid"), state.get("messages"),
-            state.get("plugin_selected"),
-            callbacks=[state.get('callback')]
-        )
-        return {"answer": answer, "ask_for_nps": False}
-
-    # no streaming
-    answer: str = answer_simple_message(
-        state.get("uid"), state.get("messages"),
-        state.get("plugin_selected"),
-    )
-    return {"answer": answer, "ask_for_nps": False}
-
-
-def omi_question(state: GraphState):
-    print("no_context_omi_question node")
-
-    context: dict = get_github_docs_content()
-    context_str = 'Documentation:\n\n'.join([f'{k}:\n {v}' for k, v in context.items()])
-
-    # streaming
-    streaming = state.get("streaming")
-    if streaming:
-        # state['callback'].put_thought_nowait("Reasoning")
-        answer: str = answer_omi_question_stream(
-            state.get("messages", []), context_str,
-            callbacks=[state.get('callback')]
-        )
-        return {'answer': answer, 'ask_for_nps': True}
-
-    # no streaming
-    answer = answer_omi_question(state.get("messages", []), context_str)
-    return {'answer': answer, 'ask_for_nps': True}
-
-
-def persona_question(state: GraphState):
-    print("persona_question node")
-
-    # streaming
-    streaming = state.get("streaming")
-    if streaming:
-        # state['callback'].put_thought_nowait("Reasoning")
-        answer: str = answer_persona_question_stream(
-            state.get("plugin_selected"),
-            state.get("messages", []),
-            callbacks=[state.get('callback')]
-        )
-        return {'answer': answer, 'ask_for_nps': True}
-
-    # no streaming
-    return {'answer': "Oops", 'ask_for_nps': True}
-
-
-def context_dependent_conversation_v1(state: GraphState):
-    question = extract_question_from_conversation(state.get("messages", []))
-    print("context_dependent_conversation parsed question:", question)
-    return {"parsed_question": question}
-
-
-def context_dependent_conversation(state: GraphState):
-    return state
-
-
-# !! include a question extractor? node?
-
-def retrieve_topics_filters(state: GraphState):
-    print("retrieve_topics_filters")
-    filters = {
-        "people": get_filter_category_items(state.get("uid"), "people"),
-        "topics": get_filter_category_items(state.get("uid"), "topics"),
-        "entities": get_filter_category_items(state.get("uid"), "entities"),
-        # 'dates': get_filter_category_items(state.get('uid'), 'dates'),
-    }
-    result = select_structured_filters(state.get("parsed_question", ""), filters)
-    filters = {
-        "topics": result.get("topics", []),
-        "people": result.get("people", []),
-        "entities": result.get("entities", []),
-        # 'dates': result.get('dates', []),
-    }
-    print("retrieve_topics_filters filters", filters)
-    return {"filters": filters}
-
-
-def retrieve_date_filters(state: GraphState):
-    print('retrieve_date_filters')
-    # TODO: if this makes vector search fail further, query firestore instead
-    dates_range = retrieve_context_dates_by_question(state.get("parsed_question", ""), state.get("tz", "UTC"))
-    print('retrieve_date_filters dates_range:', dates_range)
-    if dates_range and len(dates_range) >= 2:
-        return {"date_filters": {"start": dates_range[0], "end": dates_range[1]}}
-    return {"date_filters": {}}
-
-
-def query_vectors(state: GraphState):
-    print("query_vectors")
-
-    # # stream
-    # if state.get('streaming', False):
-    #     state['callback'].put_thought_nowait("Searching through your memories")
-
-    date_filters = state.get("date_filters")
-    uid = state.get("uid")
-    # vector = (
-    #    generate_embedding(state.get("parsed_question", ""))
-    #    if state.get("parsed_question")
-    #    else [0] * 3072
-    # )
-
-    # Use [1] * dimension to trigger the score distance to fetch all vectors by meta filters
-    vector = ([1] * 3072)
-    print("query_vectors vector:", vector[:5])
-
-    # TODO: enable it when the in-accurate topic filter get fixed
-    is_topic_filter_enabled = date_filters.get("start") is None
-    memories_id = query_vectors_by_metadata(
-        uid,
-        vector,
-        dates_filter=[date_filters.get("start"), date_filters.get("end")],
-        people=state.get("filters", {}).get("people", []) if is_topic_filter_enabled else [],
-        topics=state.get("filters", {}).get("topics", []) if is_topic_filter_enabled else [],
-        entities=state.get("filters", {}).get("entities", []) if is_topic_filter_enabled else [],
-        dates=state.get("filters", {}).get("dates", []),
-        limit=100,
-    )
-    memories = conversations_db.get_conversations_by_id(uid, memories_id)
-
-    # stream
-    # if state.get('streaming', False):
-    #    if len(memories) == 0:
-    #        msg = "No relevant memories found"
-    #    else:
-    #        msg = f"Found {len(memories)} relevant memories"
-    #    state['callback'].put_thought_nowait(msg)
-
-    # print(memories_id)
-    return {"memories_found": memories}
-
-
-def qa_handler(state: GraphState):
-    uid = state.get("uid")
-
-    # streaming
-    streaming = state.get("streaming")
-    if streaming:
-        # state['callback'].put_thought_nowait("Reasoning")
-        memories = state.get("memories_found", [])
-        response: str = qa_rag_stream(
-            uid,
-            state.get("parsed_question"),
-            Conversation.conversations_to_string(memories, False),
-            state.get("plugin_selected"),
-            cited=state.get("cited"),
-            messages=state.get("messages"),
-            tz=state.get("tz"),
-            callbacks=[state.get('callback')]
-        )
-        return {"answer": response, "ask_for_nps": True}
-
-    # no streaming
-    memories = state.get("memories_found", [])
-    response: str = qa_rag(
-        uid,
-        state.get("parsed_question"),
-        Conversation.conversations_to_string(memories, False),
-        state.get("plugin_selected"),
-        cited=state.get("cited"),
-        messages=state.get("messages"),
-        tz=state.get("tz"),
-    )
-    return {"answer": response, "ask_for_nps": True}
-
-
-def file_chat_question(state: GraphState):
-    print("chat_with_file_question node")
-
-    fc_tool = FileChatTool()
-
-    uid = state.get("uid", "")
-    question = state.get("parsed_question", "")
-
-    messages = state.get("messages", [])
-    last_message = messages[-1] if messages else None
-
-    file_ids = []
-    chat_session = state.get("chat_session")
-    if chat_session:
-        if last_message:
-            if len(last_message.files_id) > 0:
-                file_ids = last_message.files_id
-            else:
-                # if user asked about file but not attach new file, will get all file in session
-                file_ids = chat_session.file_ids
-    else:
-        file_ids = fc_tool.get_files()
-
-    streaming = state.get("streaming")
-    if streaming:
-        answer = fc_tool.process_chat_with_file_stream(uid, question, file_ids, callback=state.get('callback'))
-        return {'answer': answer, 'ask_for_nps': True}
-
-    answer = fc_tool.process_chat_with_file(uid, question, file_ids)
-    return {'answer': answer, 'ask_for_nps': True}
-
-
-workflow = StateGraph(GraphState)
-
-workflow.add_edge(START, "determine_conversation")
-
-workflow.add_node("determine_conversation", determine_conversation)
-
-workflow.add_conditional_edges("determine_conversation", determine_conversation_type)
-
-workflow.add_node("no_context_conversation", no_context_conversation)
-workflow.add_node("omi_question", omi_question)
-workflow.add_node("context_dependent_conversation", context_dependent_conversation)
-workflow.add_node("file_chat_question", file_chat_question)
-workflow.add_node("persona_question", persona_question)
-
-workflow.add_edge("no_context_conversation", END)
-workflow.add_edge("omi_question", END)
-workflow.add_edge("persona_question", END)
-workflow.add_edge("file_chat_question", END)
-workflow.add_edge("context_dependent_conversation", "retrieve_topics_filters")
-workflow.add_edge("context_dependent_conversation", "retrieve_date_filters")
-
-workflow.add_node("retrieve_topics_filters", retrieve_topics_filters)
-workflow.add_node("retrieve_date_filters", retrieve_date_filters)
-
-workflow.add_edge("retrieve_topics_filters", "query_vectors")
-workflow.add_edge("retrieve_date_filters", "query_vectors")
-
-workflow.add_node("query_vectors", query_vectors)
-
-workflow.add_edge("query_vectors", "qa_handler")
-
-workflow.add_node("qa_handler", qa_handler)
-
-workflow.add_edge("qa_handler", END)
-
-checkpointer = MemorySaver()
-graph = workflow.compile(checkpointer=checkpointer)
-
-graph_stream = workflow.compile()
-
-
-@timeit
-def execute_graph_chat(
-        uid: str, messages: List[Message], plugin: Optional[App] = None, cited: Optional[bool] = False
-) -> Tuple[str, bool, List[Conversation]]:
-    print('execute_graph_chat plugin    :', plugin.id if plugin else '<none>')
-    tz = notification_db.get_user_time_zone(uid)
-    result = graph.invoke(
-        {"uid": uid, "tz": tz, "cited": cited, "messages": messages, "plugin_selected": plugin},
-        {"configurable": {"thread_id": str(uuid.uuid4())}},
-    )
-    return result.get("answer"), result.get('ask_for_nps', False), result.get("memories_found", [])
-
-
-async def execute_graph_chat_stream(
-        uid: str, messages: List[Message], plugin: Optional[App] = None, cited: Optional[bool] = False,
-        callback_data: dict = {}, chat_session: Optional[ChatSession] = None
-) -> AsyncGenerator[str, None]:
-    print('execute_graph_chat_stream plugin: ', plugin.id if plugin else '<none>')
-    tz = notification_db.get_user_time_zone(uid)
-    callback = AsyncStreamingCallback()
-
-    task = asyncio.create_task(graph_stream.ainvoke(
-        {"uid": uid, "tz": tz, "cited": cited, "messages": messages, "plugin_selected": plugin,
-         "streaming": True, "callback": callback, "chat_session": chat_session, },
-        {"configurable": {"thread_id": str(uuid.uuid4())}},
-    ))
-
-    while True:
-        try:
-            chunk = await callback.queue.get()
-            if chunk:
-                yield chunk
-            else:
-                break
-        except asyncio.CancelledError:
-            break
-    await task
-    result = task.result()
-    callback_data['answer'] = result.get("answer")
-    callback_data['memories_found'] = result.get("memories_found", [])
-    callback_data['ask_for_nps'] = result.get('ask_for_nps', False)
-
-    yield None
-    return
+from utils.observability.langsmith import get_chat_tracer_callbacks
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+async def _current_prompt_metadata(
+    uid: str, platform: Optional[str], client_tz: Optional[str] = None
+) -> tuple[str, str]:
+    try:
+        tz = client_tz or await run_blocking(db_executor, get_user_timezone, uid)
+        city = await get_mobile_city(uid, platform)
+        return get_current_datetime_block(uid, tz=tz, location=city), tz
+    except Exception as error:
+        logger.warning('Prompt metadata unavailable error_type=%s', type(error).__name__)
+        return get_current_datetime_block(uid, tz='UTC'), 'UTC'
+
+
+def _with_prompt_metadata(text: str, metadata: str) -> str:
+    return f'{metadata}\n\n{text}'
+
+
+async def _drain_chat_callback(
+    callback: AsyncStreamingCallback, task: asyncio.Task, *, route: str
+) -> AsyncGenerator[str | None, None]:
+    """Drain a callback queue without allowing its producer to strand an SSE response."""
+    started_at = asyncio.get_running_loop().time()
+    received_first_event = False
+    try:
+        while True:
+            remaining_seconds = AGENT_STREAM_MAX_DURATION_SECONDS - (asyncio.get_running_loop().time() - started_at)
+            if remaining_seconds <= 0:
+                raise asyncio.TimeoutError
+
+            wait_timeout = min(
+                (
+                    AGENT_STREAM_FIRST_EVENT_TIMEOUT_SECONDS
+                    if not received_first_event
+                    else AGENT_STREAM_PROGRESS_HEARTBEAT_SECONDS
+                ),
+                remaining_seconds,
+            )
+            try:
+                chunk = await next_stream_chunk(callback, task, wait_timeout)
+            except asyncio.TimeoutError:
+                if received_first_event and remaining_seconds > wait_timeout:
+                    yield f'think: {AGENT_STREAM_PROGRESS_HEARTBEAT}'
+                    continue
+                raise
+
+            if chunk is None:
+                await task
+                return
+
+            received_first_event = True
+            yield chunk
+    except asyncio.TimeoutError:
+        logger.warning('%s chat stream reached its bounded deadline', route)
+        await cancel_stream_task(task)
+        yield f'error: {AGENT_STREAM_TIMEOUT_MESSAGE}'
+    except asyncio.CancelledError:
+        await cancel_stream_task(task)
+        raise
+    except Exception as error:
+        logger.error('%s chat stream failed error_type=%s', route, type(error).__name__)
+        await cancel_stream_task(task)
+        yield f'error: {AGENT_STREAM_FAILURE_MESSAGE}'
+    finally:
+        if not task.done():
+            task.cancel()
+
+
+# ---------------------------------------------------------------------------
+# Persona chat (kept on existing LangChain/OpenAI for now)
+# ---------------------------------------------------------------------------
 
 
 async def execute_persona_chat_stream(
-        uid: str, messages: List[Message], app: App, cited: Optional[bool] = False,
-        callback_data: dict = None, chat_session: Optional[str] = None
-) -> AsyncGenerator[str, None]:
-    """Handle streaming chat responses for persona-type apps"""
-
+    uid: str,
+    messages: List[Message],
+    app: App,
+    cited: Optional[bool] = False,
+    callback_data: Optional[Dict[str, Any]] = None,
+    chat_session: Optional[ChatSession] = None,
+    current_datetime_block: Optional[str] = None,
+) -> AsyncGenerator[Optional[str], None]:
+    """Handle streaming chat responses for persona-type apps."""
+    if callback_data is not None:
+        callback_data.setdefault('route', 'persona')
     system_prompt = app.persona_prompt
-    formatted_messages = [SystemMessage(content=system_prompt)]
+    formatted_messages: List[BaseMessage] = [SystemMessage(content=system_prompt)]
 
-    for msg in messages:
+    for index, msg in enumerate(messages):
         if msg.sender == "ai":
             formatted_messages.append(AIMessage(content=msg.text))
         else:
-            formatted_messages.append(HumanMessage(content=msg.text))
+            text = msg.text
+            if current_datetime_block and index == len(messages) - 1:
+                text = _with_prompt_metadata(text, current_datetime_block)
+            formatted_messages.append(HumanMessage(content=text))
 
-    full_response = []
+    full_response: List[str] = []
     callback = AsyncStreamingCallback()
 
-    try:
-        task = asyncio.create_task(llm_medium_stream.agenerate(
-            messages=[formatted_messages],
-            callbacks=[callback]
-        ))
+    # Generate run_id for LangSmith tracing
+    langsmith_run_id = str(uuid.uuid4())
 
-        while True:
-            try:
-                chunk = await callback.queue.get()
-                if chunk:
-                    token = chunk.replace("data: ", "")
-                    full_response.append(token)
-                    yield chunk
-                else:
-                    break
-            except asyncio.CancelledError:
-                break
+    tracer_callbacks = get_chat_tracer_callbacks(
+        run_id=langsmith_run_id,
+        run_name="chat.persona.stream",
+        tags=["chat", "persona", "streaming"],
+        metadata={
+            "uid": uid,
+            "app_id": app.id if app else None,
+            "app_name": app.name if app else None,
+            "cited": cited,
+        },
+    )
+
+    all_callbacks: List[Any] = [callback] + tracer_callbacks
+
+    run_metadata: Dict[str, Any] = {
+        "run_id": langsmith_run_id,
+        "run_name": "chat.persona.stream",
+        "tags": ["chat", "persona", "streaming"],
+        "metadata": {
+            "uid": uid,
+            "app_id": app.id if app else None,
+            "app_name": app.name if app else None,
+            "cited": cited,
+        },
+    }
+
+    if callback_data is not None:
+        callback_data['langsmith_run_id'] = langsmith_run_id
+
+    try:
+        with track_usage(uid, Features.CHAT):
+            task = asyncio.create_task(
+                get_llm('chat_graph', streaming=True).agenerate(
+                    messages=[formatted_messages], callbacks=all_callbacks, **run_metadata
+                )
+            )
+
+        async for chunk in _drain_chat_callback(callback, task, route='persona'):
+            if chunk and chunk.startswith('error: '):
+                if callback_data is not None:
+                    callback_data['error'] = 'stream_failure'
+                    callback_data['answer'] = chunk[len('error: ') :]
+                yield chunk
+                yield None
+                return
+            if chunk:
+                if chunk.startswith("data: "):
+                    full_response.append(chunk.removeprefix("data: "))
+                yield chunk
 
         await task
 
@@ -509,9 +205,103 @@ async def execute_persona_chat_stream(
         yield None
         return
 
-    except Exception as e:
-        print(f"Error in execute_persona_chat_stream: {e}")
+    except Exception as error:
+        logger.error('persona chat stream failed error_type=%s', type(error).__name__)
         if callback_data is not None:
-            callback_data['error'] = str(e)
+            callback_data['error'] = 'stream_failure'
+            callback_data['answer'] = AGENT_STREAM_FAILURE_MESSAGE
+        yield f'error: {AGENT_STREAM_FAILURE_MESSAGE}'
         yield None
         return
+
+
+# ---------------------------------------------------------------------------
+# Main router
+# ---------------------------------------------------------------------------
+
+
+async def execute_chat_stream(
+    uid: str,
+    messages: List[Message],
+    app: Optional[App] = None,
+    cited: Optional[bool] = False,
+    callback_data: Optional[Dict[str, Any]] = None,
+    chat_session: Optional[ChatSession] = None,
+    context: Optional[PageContext] = None,
+    platform: Optional[str] = None,
+    client_kind: Optional[ClientKind] = None,
+    client_tz: Optional[str] = None,
+    device_tool_names: Optional[set] = None,
+    shaped_invocation: bool = False,
+) -> AsyncGenerator[Optional[str], None]:
+    """Route chat requests to the agentic chat handler.
+
+    All selected apps (chat and persona capable) run through the same agentic
+    stream; the selected app's personality text is applied inside the shared
+    system prompt rather than replacing it.
+    """
+    if callback_data is None:
+        callback_data = {}
+    logger.info(f'execute_chat_stream app: {app.id if app else "<none>"}')
+    # One absolute setup deadline covers router metadata and agentic prompt/tool
+    # load so the SSE body cannot stay silent for two stacked 25s budgets.
+    setup_deadline_at = asyncio.get_running_loop().time() + AGENT_STREAM_SETUP_TIMEOUT_SECONDS
+    try:
+        async with asyncio.timeout(max(0.0, setup_deadline_at - asyncio.get_running_loop().time())):
+            current_datetime_block, tz = await _current_prompt_metadata(uid, platform, client_tz=client_tz)
+    except TimeoutError:
+        logger.error(
+            'chat stream setup timed out route=router uid=%s reason=setup_timeout',
+            uid,
+        )
+        callback_data['error'] = 'setup_timeout'
+        callback_data['route'] = 'router'
+        callback_data['answer'] = AGENT_STREAM_TIMEOUT_MESSAGE
+        yield f'error: {AGENT_STREAM_TIMEOUT_MESSAGE}'
+        yield None
+        return
+
+    # Persona apps previously took a dedicated LangChain/OpenAI stream; every
+    # turn now keeps the shared prompt, history and tools so a selected persona
+    # cannot drop tool, memory, or file access.
+    async for chunk in execute_agentic_chat_stream(
+        uid,
+        messages,
+        app,
+        callback_data=callback_data,
+        chat_session=chat_session,
+        context=context,
+        platform=platform,
+        client_kind=client_kind,
+        current_datetime_block=current_datetime_block,
+        tz=tz,
+        setup_deadline_at=setup_deadline_at,
+        device_tool_names=device_tool_names,
+        shaped_invocation=shaped_invocation,
+    ):
+        yield chunk
+
+
+# Backward compatibility aliases
+execute_graph_chat_stream = execute_chat_stream
+
+
+def execute_graph_chat(
+    uid: str, messages: List[Message], app: Optional[App] = None, cited: Optional[bool] = False
+) -> Tuple[str, bool, List[Conversation]]:
+    """Synchronous chat execution (backward compatibility).
+
+    Runs the streaming chat and collects the result.
+    """
+    callback_data: Dict[str, Any] = {}
+
+    async def _run():
+        async for _ in execute_chat_stream(uid, messages, app, cited=cited, callback_data=callback_data):
+            pass
+
+    asyncio.run(_run())
+    return (
+        callback_data.get('answer', ''),
+        callback_data.get('ask_for_nps', False),
+        callback_data.get('memories_found', []),
+    )

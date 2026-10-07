@@ -1,0 +1,817 @@
+from datetime import datetime, timezone
+from types import SimpleNamespace
+import re
+import json
+
+import pytest
+
+# firebase_admin reaches google.auth.credentials lazily. When an earlier test module has already
+# imported google.auth without that submodule, the attribute lookup fails during our imports below.
+import google.auth.credentials  # noqa: F401
+
+from models.calendar_context import CalendarMeetingContext, MeetingParticipant
+from models.structured import ActionItem, Structured
+from testing.import_isolation import stub_modules
+from utils.llm.model_config import LUNA_MODEL
+
+
+@pytest.fixture(scope='module', autouse=True)
+def isolated_imports():
+    with stub_modules({}):
+        # Keep production-module import cost out of individual fast-unit timing.
+        import utils.conversations.meeting_context  # noqa: F401
+        import utils.llm.conversation_processing  # noqa: F401
+        import utils.llm.conversation_prompt_prefix  # noqa: F401
+        import utils.llm.working_observations  # noqa: F401
+
+        yield
+
+
+def _joined_message_text(messages) -> str:
+    parts: list[str] = []
+    for message in messages:
+        content = message.content if hasattr(message, 'content') else message['content']
+        if isinstance(content, list):
+            parts.extend(part.get('text', '') for part in content if isinstance(part, dict))
+        else:
+            parts.append(str(content))
+    return '\n'.join(parts)
+
+
+def _meeting_context() -> CalendarMeetingContext:
+    return CalendarMeetingContext(
+        calendar_event_id='screen-activity',
+        title='Fulcrum Dynamics',
+        participants=[
+            MeetingParticipant(name='David'),
+            MeetingParticipant(name='Ash Kalb', email='ash@fulcradynamics.com'),
+        ],
+        platform='Zoom',
+        start_time=datetime(2026, 8, 18, 14, 0, tzinfo=timezone.utc),
+        duration_minutes=30,
+        calendar_source='screen_activity',
+    )
+
+
+def _long_transcript() -> str:
+    detail = 'Mem0 HSM GPT store catalog revoke Greg Leaf Discord September 8 '
+    return '\n\n'.join([f'[s{i} {i % 2}] {detail}' for i in range(100)])
+
+
+def _speaker_map() -> dict[int, str | None]:
+    # Cluster 0 is the user (David); cluster 1 is unmatched until the calendar guard binds it.
+    return {0: 'David', 1: None}
+
+
+def test_structured_additions_are_backward_compatible():
+    old = Structured.model_validate(
+        {
+            'title': 'Legacy note',
+            'overview': 'Old overview',
+            'emoji': '🧠',
+            'category': 'work',
+            'action_items': [{'description': 'Send invite'}],
+            'events': [],
+        }
+    )
+
+    assert old.sections == []
+    assert old.action_items[0].owner_name is None
+    assert old.action_items[0].context is None
+    assert old.action_items[0].due_certainty is None
+
+
+@pytest.mark.parametrize('marked_source', [True, False])
+def test_merged_note_call_projects_sections_and_preserves_action_detail(monkeypatch, marked_source):
+    from utils.llm import conversation_processing
+    from utils.llm.conversation_prompt_context import build_conversation_prompt_prefix
+
+    prefix = build_conversation_prompt_prefix(
+        conversation_id='conv-123',
+        transcript=_long_transcript() if marked_source else re.sub(r'\[[^]]+\] ', '', _long_transcript()),
+        started_at=datetime(2026, 8, 18, 14, 0, tzinfo=timezone.utc),
+        timezone_name='America/New_York',
+        language_code='en',
+        calendar_context=_meeting_context(),
+        speaker_map=_speaker_map(),
+        transcript_segment_ids=[f's{i}' for i in range(100)] if marked_source else [],
+    )
+    captured = {}
+
+    class Model:
+        def invoke(self, messages):
+            captured['messages'] = messages
+            content = '''{
+                  "title":"Speaker 1 and Ash Discuss Agent Infrastructure",
+                  "overview":"compatibility",
+                  "emoji":"🔐",
+                  "category":"technology",
+                  "sections":[{"heading":"Agent operations","body_markdown":"- Ash runs ~12 long-running agents.\\n- The team proposed a review; it has not started.","source_segment_ids":["s1"]}],
+                  "action_items":[{"description":"Send Fulcrum dinner invite","owner_name":"David","context":"Tentative NYC lunch or dinner with Ash.","due_at":"2026-09-08T12:00:00","due_certainty":"tentative","capture_owner":"user","source_segment_ids":["s9"]}],
+                  "events":[]
+                }'''
+            if not marked_source:
+                payload = json.loads(content)
+                for item in payload['sections'] + payload['action_items']:
+                    item['source_segment_ids'] = []
+                content = json.dumps(payload)
+            return SimpleNamespace(content=content)
+
+    def fake_get_llm(_feature, **kwargs):
+        captured['kwargs'] = kwargs
+        return Model()
+
+    monkeypatch.setattr(conversation_processing, 'get_llm', fake_get_llm)
+    monkeypatch.setattr(conversation_processing, 'shared_conversation_cache_supported', lambda: True)
+    result = conversation_processing.get_conversation_notes(
+        prefix,
+        started_at=datetime(2026, 8, 18, 14, 0, tzinfo=timezone.utc),
+        language_code='en',
+        output_language_code='en',
+        tz='America/New_York',
+        task_intelligence_capture=True,
+    )
+
+    assert result.overview == (
+        '## Agent operations\n\n- Ash runs ~12 long-running agents.\n'
+        '- The team proposed a review; it has not started.'
+    )
+    assert re.search(r'(?i)\b(?:speaker[ _]\d+|SPEAKER_\d+)\b', result.title) is None
+    assert result.events == []
+    assert result.sections[0].source_segment_ids == (['s1'] if marked_source else [])
+    assert result.action_items[0].owner_name == 'David'
+    assert result.action_items[0].due_certainty == 'tentative'
+    assert captured['kwargs']['cache_key'] == conversation_processing.CONVERSATION_NOTES_CACHE_KEY
+    assert captured['messages'][0].content[0]['prompt_cache_breakpoint'] == {'mode': 'explicit'}
+    instructions = _joined_message_text(captured['messages'])
+    assert 'Never normalize or "correct" an uncertain name from general knowledge' in instructions
+    assert 'participant email domain corroborates' in instructions
+    assert 'fulcradynamics.com corroborates "Fulcra Dynamics" over ASR "Vulcra"' in instructions
+    assert 'Speaker keys are diarization clusters, not names' in instructions
+    assert 'whether or not calendar' in instructions
+    assert 'Ash Kalb <ash@fulcradynamics.com>' in prefix.context
+    assert 'spk 0 David' in prefix.context
+    assert 'spk 1 Ash Kalb' in prefix.context
+    assert 'Speaker 1:' not in prefix.context
+    # Prompt-contract assertions only: live source replay, not this mock, measures model fidelity.
+    assert "'- ' bullets in plain, readable sentences" in instructions
+    assert 'Keep past anecdotes, current plans, and unrelated threads separate' in instructions
+    assert 'Do not complete clipped amounts' in instructions
+    assert 'return empty source_segment_ids lists' in instructions
+    assert 'Never invent IDs' in instructions
+    assert 'not quotas' in instructions
+    assert 'COVERAGE BEATS BREVITY' not in instructions
+    assert 'terse fragments, not sentences' not in instructions
+
+
+def test_memory_places_conversation_context_after_the_instruction_prefix(monkeypatch):
+    from utils.llm.conversation_prompt_context import build_conversation_prompt_prefix
+    from utils.llm.working_observations import extract_l1_memory_archive_items_from_text
+
+    prefix = build_conversation_prompt_prefix(
+        conversation_id='conv-shared',
+        transcript=_long_transcript(),
+        started_at=datetime(2026, 8, 18, 14, 0, tzinfo=timezone.utc),
+        timezone_name='America/New_York',
+        language_code='en',
+        calendar_context=_meeting_context(),
+        speaker_map=_speaker_map(),
+    )
+    expected = prefix.messages(cache_enabled=True)
+    rebuilt_for_memory = build_conversation_prompt_prefix(
+        conversation_id='conv-shared',
+        transcript=_long_transcript(),
+        started_at=datetime(2026, 8, 18, 14, 0, tzinfo=timezone.utc),
+        timezone_name='America/New_York',
+        language_code='en',
+        calendar_context=_meeting_context(),
+        speaker_map=_speaker_map(),
+    )
+    assert rebuilt_for_memory.messages(cache_enabled=True) == expected
+    assert 'Speaker 1:' not in prefix.context
+    assert 'spk 1 Ash Kalb' in prefix.context
+
+    class MemoryModel:
+        def __init__(self):
+            self.messages = None
+
+        def invoke(self, messages):
+            self.messages = messages
+            return SimpleNamespace(content='{"items": []}')
+
+    model = MemoryModel()
+    result = extract_l1_memory_archive_items_from_text(
+        uid='u1',
+        source_id='conv-shared',
+        source_type='voice_transcript',
+        text=_long_transcript(),
+        prompt_prefix=prefix,
+        prompt_cache_enabled=True,
+        llm=model,
+    )
+
+    assert result == []
+    assert model.messages[0]['content'][0]['prompt_cache_breakpoint'] == {'mode': 'explicit'}
+    assert model.messages[1:3] == prefix.messages(cache_enabled=False)
+
+
+def test_screen_activity_context_is_bounded_to_conferencing_rows_and_names():
+    from utils.conversations.meeting_context import context_from_screen_activity
+
+    # Names come only from a source that asserts participation (here the Meet
+    # roster sentence). A bare capitalised line is NOT enough — see
+    # tests/unit/test_screen_activity_identity.py for why.
+    context = context_from_screen_activity(
+        [
+            {'appName': 'Cursor', 'windowTitle': 'notes.py', 'ocrText': 'Not A Participant'},
+            {
+                'appName': 'zoom.us',
+                'windowTitle': 'Fulcrum Dynamics',
+                'ocrText': 'Ash Kalb and David Zhang are in this call\nMute\nStop Video',
+            },
+        ],
+        started_at=datetime(2026, 8, 18, 14, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 8, 18, 14, 30, tzinfo=timezone.utc),
+    )
+
+    assert context is not None
+    assert context.title == 'Fulcrum Dynamics'
+    assert [participant.name for participant in context.participants] == ['Ash Kalb', 'David Zhang']
+    assert context.calendar_source == 'screen_activity'
+
+
+def test_action_item_new_fields_round_trip():
+    item = ActionItem(
+        description='Send invite',
+        owner_name='David',
+        context='Tentative dinner with Ash.',
+        due_certainty='tentative',
+    )
+    assert ActionItem.model_validate_json(item.model_dump_json()) == item
+
+
+def test_notes_without_calendar_context_strip_speaker_placeholders():
+    from utils.llm.conversation_processing import sanitize_structured_speaker_placeholders
+
+    leftover = re.compile(r'(?i)\b(?:speaker[ _]\d+|SPEAKER_\d+)\b')
+    structured = Structured.model_validate(
+        {
+            'title': 'Speaker 1 Reviews Budget',
+            'overview': 'Speaker 1 said the budget is late.',
+            'emoji': '💬',
+            'category': 'work',
+            'sections': [
+                {
+                    'heading': 'Budget',
+                    'body_markdown': '- Speaker 1: budget is late\n- SPEAKER_00 agreed',
+                    'source_segment_ids': ['s1'],
+                }
+            ],
+            'action_items': [
+                {
+                    'description': 'Follow up with Speaker 1',
+                    'owner_name': 'Speaker 1',
+                    'source_segment_ids': ['s1'],
+                }
+            ],
+            'events': [],
+        }
+    )
+    sanitize_structured_speaker_placeholders(structured)
+
+    assert leftover.search(structured.title) is None
+    assert leftover.search(structured.overview) is None
+    assert leftover.search(structured.sections[0].body_markdown) is None
+    assert leftover.search(structured.action_items[0].description) is None
+    assert structured.action_items[0].owner_name is None
+
+
+def test_note_source_refs_are_membership_checked_and_deduplicated(monkeypatch):
+    from utils.llm import conversation_processing
+    from utils.llm.conversation_prompt_context import ConversationPromptPrefix
+
+    prefix = ConversationPromptPrefix(
+        conversation_id='conv-evidence',
+        context='CONVERSATION METADATA\n- Captured at: now (UTC)\n\n'
+        'FULL TRANSCRIPT\n[s1 0] First point\n[s2] Second point',
+        transcript_segment_ids=frozenset({'s1', 's2'}),
+    )
+
+    class Model:
+        def invoke(self, _messages):
+            return SimpleNamespace(
+                content=json.dumps(
+                    {
+                        'title': 'Evidence',
+                        'overview': 'compatibility',
+                        'emoji': '🧠',
+                        'category': 'work',
+                        'sections': [
+                            {
+                                'heading': 'Points',
+                                'body_markdown': '- Grounded',
+                                'source_segment_ids': ['s2', 's2', 'invented', 's1'],
+                            }
+                        ],
+                        'action_items': [
+                            {
+                                'description': 'Follow up',
+                                'source_segment_ids': ['invented', 's1', 's1'],
+                            }
+                        ],
+                        'events': [],
+                    }
+                )
+            )
+
+    monkeypatch.setattr(conversation_processing, 'get_llm', lambda *_args, **_kwargs: Model())
+    monkeypatch.setattr(conversation_processing, 'shared_conversation_cache_supported', lambda: False)
+    result = conversation_processing.get_conversation_notes(
+        prefix,
+        started_at=datetime(2026, 8, 18, 14, 0, tzinfo=timezone.utc),
+        language_code='en',
+        output_language_code='en',
+        tz='UTC',
+        task_intelligence_capture=True,
+    )
+
+    assert result.sections[0].source_segment_ids == ['s2', 's1']
+    assert result.action_items[0].source_segment_ids == ['s1']
+
+
+def test_note_source_refs_are_empty_without_transcript_headers(monkeypatch):
+    from utils.llm import conversation_processing
+    from utils.llm.conversation_prompt_context import ConversationPromptPrefix
+
+    prefix = ConversationPromptPrefix(
+        conversation_id='conv-no-evidence',
+        context='FULL TRANSCRIPT\n[sFake 0] Bracket-like user text, not a source identity',
+    )
+
+    class Model:
+        def invoke(self, _messages):
+            return SimpleNamespace(
+                content=json.dumps(
+                    {
+                        'title': 'Evidence',
+                        'overview': 'compatibility',
+                        'emoji': '🧠',
+                        'category': 'work',
+                        'sections': [
+                            {'heading': 'Points', 'body_markdown': '- Ungrounded', 'source_segment_ids': ['s1']}
+                        ],
+                        'action_items': [{'description': 'Follow up', 'source_segment_ids': ['s1']}],
+                        'events': [],
+                    }
+                )
+            )
+
+    monkeypatch.setattr(conversation_processing, 'get_llm', lambda *_args, **_kwargs: Model())
+    monkeypatch.setattr(conversation_processing, 'shared_conversation_cache_supported', lambda: False)
+    result = conversation_processing.get_conversation_notes(
+        prefix,
+        started_at=datetime(2026, 8, 18, 14, 0, tzinfo=timezone.utc),
+        language_code='en',
+        output_language_code='en',
+        tz='UTC',
+        task_intelligence_capture=True,
+    )
+
+    assert result.sections[0].source_segment_ids == []
+    assert result.action_items[0].source_segment_ids == []
+
+
+def test_source_segment_refs_drop_non_string_ids():
+    """Malformed non-string ids never become valid evidence references."""
+    from utils.llm.meeting_notes_validation import validate_structured_source_segment_ids
+
+    structured = SimpleNamespace(
+        sections=[SimpleNamespace(source_segment_ids=['s1', 7])],
+        action_items=[SimpleNamespace(source_segment_ids=['s1', 7])],
+    )
+    result = validate_structured_source_segment_ids(structured, ['s1', 7])
+
+    assert result.sections[0].source_segment_ids == ['s1']
+    assert result.action_items[0].source_segment_ids == ['s1']
+
+
+def test_presentation_contract_recovers_inline_citations_and_neutralizes_unsafe_links():
+    from utils.llm.meeting_notes_validation import enforce_structured_presentation_contract
+
+    source_id = '443191dc-8b75-4451-9d72-27c449b9ea45'
+    unknown_id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    structured = Structured.model_validate(
+        {
+            'title': 'Dinner',
+            'sections': [
+                {
+                    'heading': 'Plans',
+                    'body_markdown': (
+                        f'- Shared hot pot. ([{source_id}]({source_id}); s2)\n'
+                        '- Standalone source [s3](s3)\n'
+                        f'- Preserved reference {unknown_id}.\n'
+                        '  - Nested detail stays nested.\n'
+                        'Hard break stays here.  \nNext line.\n'
+                        '- Open [local file](file:///tmp/private).'
+                    ),
+                    'source_segment_ids': ['invented'],
+                }
+            ],
+        }
+    )
+
+    report = enforce_structured_presentation_contract(structured, [source_id, 's2', 's3'])
+
+    assert structured.sections[0].body_markdown == (
+        f'- Shared hot pot.\n- Standalone source\n- Preserved reference {unknown_id}.\n'
+        '  - Nested detail stays nested.\nHard break stays here.  \nNext line.\n- Open local file.'
+    )
+    assert structured.sections[0].source_segment_ids == [source_id, 's2', 's3']
+    assert report.repairs == {'inline_source_citation', 'invalid_source_reference', 'unsafe_markdown_link'}
+    assert not report.needs_revision
+
+    overview_only = Structured(overview=f'Compatibility text exposed {source_id}.')
+    first_report = enforce_structured_presentation_contract(overview_only, [source_id])
+    assert first_report.needs_revision
+    fallback_report = enforce_structured_presentation_contract(overview_only, [source_id], safe_fallback=True)
+    assert source_id not in overview_only.overview
+    assert fallback_report.repairs == {'source_id_in_prose'}
+
+
+@pytest.mark.parametrize('second_pass_is_clean', [True, False])
+def test_presentation_contract_allows_one_revision_then_falls_back(monkeypatch, second_pass_is_clean):
+    from utils.llm import conversation_processing, meeting_notes_presentation
+    from utils.llm.conversation_prompt_context import ConversationPromptPrefix
+
+    source_id = 'seg-private-1'
+    prefix = ConversationPromptPrefix(
+        conversation_id='conv-contract',
+        context=f'FULL TRANSCRIPT\n[{source_id} 0] First point',
+        transcript_segment_ids=frozenset({source_id}),
+    )
+    calls = []
+    fallbacks = []
+
+    class Model:
+        def invoke(self, messages):
+            calls.append(messages)
+            leaking = len(calls) == 1 or not second_pass_is_clean
+            return SimpleNamespace(
+                content=json.dumps(
+                    {
+                        'title': 'Evidence',
+                        'overview': 'compatibility',
+                        'emoji': '🧠',
+                        'category': 'work',
+                        'sections': [
+                            {
+                                'heading': 'Point',
+                                'body_markdown': (
+                                    f'- The identifier {source_id} supports this.' if leaking else '- First point.'
+                                ),
+                                'source_segment_ids': [source_id],
+                            }
+                        ],
+                        'action_items': [],
+                        'events': [],
+                    }
+                )
+            )
+
+    monkeypatch.setattr(conversation_processing, 'get_llm', lambda *_args, **_kwargs: Model())
+    monkeypatch.setattr(conversation_processing, 'shared_conversation_cache_supported', lambda: False)
+    monkeypatch.setattr(meeting_notes_presentation, '_record_fallback', lambda **kwargs: fallbacks.append(kwargs))
+    result = conversation_processing.get_conversation_notes(
+        prefix,
+        started_at=datetime(2026, 8, 18, 14, 0, tzinfo=timezone.utc),
+        language_code='en',
+        output_language_code='en',
+        tz='UTC',
+        task_intelligence_capture=True,
+    )
+
+    assert len(calls) == 2
+    assert 'Regenerate the complete JSON once' in _joined_message_text(calls[1])
+    assert source_id not in result.sections[0].body_markdown
+    assert result.sections[0].source_segment_ids == [source_id]
+    assert ('First point.' in result.sections[0].body_markdown) is second_pass_is_clean
+    assert fallbacks == ([] if second_pass_is_clean else [{'reason': 'policy'}])
+
+
+def test_presentation_contract_revision_error_keeps_sanitized_first_response(monkeypatch, caplog):
+    from utils.llm import conversation_processing, meeting_notes_presentation
+    from utils.llm.conversation_prompt_context import ConversationPromptPrefix
+
+    source_id = 'seg-private-1'
+    prefix = ConversationPromptPrefix(
+        conversation_id='conv-contract-error',
+        context=f'FULL TRANSCRIPT\n[{source_id} 0] First point',
+        transcript_segment_ids=frozenset({source_id}),
+    )
+    calls = 0
+    fallbacks = []
+
+    class Model:
+        def invoke(self, _messages):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                return SimpleNamespace(content='{"private":"PRIVATE-NOTE-CANARY"')
+            return SimpleNamespace(
+                content=json.dumps(
+                    {
+                        'title': 'Evidence',
+                        'sections': [
+                            {
+                                'heading': 'Point',
+                                'body_markdown': f'- Keep the useful first response without {source_id}.',
+                                'source_segment_ids': [source_id],
+                            }
+                        ],
+                    }
+                )
+            )
+
+    monkeypatch.setattr(conversation_processing, 'get_llm', lambda *_args, **_kwargs: Model())
+    monkeypatch.setattr(conversation_processing, 'shared_conversation_cache_supported', lambda: False)
+    monkeypatch.setattr(meeting_notes_presentation, '_record_fallback', lambda **kwargs: fallbacks.append(kwargs))
+    result = conversation_processing.get_conversation_notes(
+        prefix,
+        started_at=datetime(2026, 8, 18, 14, 0, tzinfo=timezone.utc),
+        language_code='en',
+        output_language_code='en',
+        tz='UTC',
+        task_intelligence_capture=True,
+    )
+
+    assert calls == 2
+    assert result.sections[0].body_markdown == '- Keep the useful first response without.'
+    assert result.sections[0].source_segment_ids == [source_id]
+    assert fallbacks == [{'reason': 'other'}]
+    assert 'PRIVATE-NOTE-CANARY' not in caplog.text
+
+
+def test_telegram_screen_identity_prefix_uses_real_name_not_speaker_placeholder():
+    from utils.conversations.meeting_context import context_from_screen_activity
+    from utils.llm.conversation_prompt_context import build_conversation_prompt_prefix
+
+    context = context_from_screen_activity(
+        [
+            {
+                'appName': 'Telegram',
+                'windowTitle': 'Alice Chen',
+                'ocrText': 'Mute\nEnd Call\nVideo',
+            }
+        ],
+        started_at=datetime(2026, 8, 18, 14, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 8, 18, 14, 30, tzinfo=timezone.utc),
+    )
+    assert context is not None
+    # Inputs exactly as the compact renderer emits them for one unresolved cluster
+    # (renderer→map wiring is pinned in test_compact_speaker_transcript.py).
+    transcript = '[seg-1 1] the flight is at noon'
+    speaker_map = {1: None}
+    prefix = build_conversation_prompt_prefix(
+        conversation_id='conv-telegram',
+        transcript=transcript,
+        started_at=datetime(2026, 8, 18, 14, 0, tzinfo=timezone.utc),
+        timezone_name='America/New_York',
+        language_code='en',
+        calendar_context=context,
+        speaker_map=speaker_map,
+    )
+    assert transcript in prefix.context
+    assert 'spk 1 Alice Chen' in prefix.context
+    assert 'Speaker' not in prefix.context
+
+
+def _minimal_note_payload() -> str:
+    return json.dumps(
+        {
+            'title': 'Evidence',
+            'overview': 'compatibility',
+            'emoji': '',
+            'category': 'work',
+            'sections': [],
+            'action_items': [],
+            'events': [],
+        }
+    )
+
+
+def _notes_call_kwargs() -> dict:
+    return {
+        'started_at': datetime(2026, 8, 18, 14, 0, tzinfo=timezone.utc),
+        'language_code': 'en',
+        'output_language_code': 'en',
+        'tz': 'UTC',
+        'task_intelligence_capture': True,
+    }
+
+
+@pytest.fixture()
+def openai_wire_encoder():
+    from langchain_openai import ChatOpenAI
+
+    return ChatOpenAI(model='gpt-6-luna', api_key='sk-test')
+
+
+def test_volatile_instructions_reach_gemini_contents_as_a_user_message(monkeypatch, openai_wire_encoder):
+    """Vertex moves system messages to systemInstruction, so a request whose only
+    non-system message is missing serializes with empty ``contents`` — the exact
+    shape Gemini 400s on. The volatile suffix must be a user message."""
+    from llm_gateway.gateway.vertex_wire import _vertex_request
+    from utils.llm import conversation_processing
+    from utils.llm.conversation_prompt_context import build_conversation_prompt_prefix
+
+    prefix = build_conversation_prompt_prefix(
+        conversation_id='conv-vertex-wire',
+        transcript='[s1 0] The launch moved to Friday.',
+        started_at=datetime(2026, 8, 18, 14, 0, tzinfo=timezone.utc),
+        timezone_name='UTC',
+        language_code='en',
+        transcript_segment_ids=['s1'],
+    )
+    captured = {}
+
+    class Model:
+        def invoke(self, messages):
+            captured['messages'] = messages
+            return SimpleNamespace(content=_minimal_note_payload())
+
+    monkeypatch.setattr(conversation_processing, 'get_llm', lambda *_args, **_kwargs: Model())
+    monkeypatch.setattr(conversation_processing, 'shared_conversation_cache_supported', lambda: False)
+    conversation_processing.get_conversation_notes(prefix, **_notes_call_kwargs())
+
+    wire = openai_wire_encoder._get_request_payload(captured['messages'])['messages']
+    assert any(message['role'] != 'system' for message in wire)
+    vertex_payload = _vertex_request({'messages': wire})
+    assert vertex_payload['contents']
+    user_text = '\n'.join(part.get('text', '') for content in vertex_payload['contents'] for part in content['parts'])
+    assert 'The launch moved to Friday.' in user_text
+    system_text = '\n'.join(part['text'] for part in vertex_payload['systemInstruction']['parts'])
+    assert 'Create the canonical conversation note' in system_text
+    assert 'The launch moved to Friday.' not in system_text
+
+
+@pytest.mark.parametrize(
+    'transcript',
+    ['', '   \n  ', '[s1 0]   ', '[s1 0]\n\n[s2]   '],
+)
+def test_blank_transcript_content_never_invokes_the_notes_model(monkeypatch, transcript):
+    """Metadata-only renders and compact headers over whitespace segments carry
+    nothing the model can use — the call must not happen."""
+    from unittest.mock import Mock
+
+    from utils.llm import conversation_processing
+    from utils.llm.conversation_prompt_context import build_conversation_prompt_prefix
+
+    prefix = build_conversation_prompt_prefix(
+        conversation_id='conv-blank',
+        transcript=transcript,
+        started_at=datetime(2026, 8, 18, 14, 0, tzinfo=timezone.utc),
+        timezone_name='UTC',
+        language_code='en',
+        transcript_segment_ids=['s1', 's2'],
+    )
+    get_llm = Mock(side_effect=AssertionError('notes model called for a content-free capture'))
+    monkeypatch.setattr(conversation_processing, 'get_llm', get_llm)
+    result = conversation_processing.get_conversation_notes(prefix, **_notes_call_kwargs())
+
+    get_llm.assert_not_called()
+    assert result.title == '' and result.overview == '' and result.sections == []
+
+
+@pytest.mark.parametrize(
+    ('description', 'invokes'),
+    [('A whiteboard sketch of the roadmap', True), ('   ', False)],
+)
+def test_described_photos_decide_whether_a_textless_capture_invokes_the_model(monkeypatch, description, invokes):
+    from unittest.mock import Mock
+
+    from models.conversation_photo import ConversationPhoto
+    from utils.llm import conversation_processing
+    from utils.llm.conversation_prompt_context import build_conversation_prompt_prefix
+
+    prefix = build_conversation_prompt_prefix(
+        conversation_id='conv-photos',
+        transcript='   ',
+        started_at=datetime(2026, 8, 18, 14, 0, tzinfo=timezone.utc),
+        timezone_name='UTC',
+        language_code='en',
+        photos=[ConversationPhoto(base64='QUJD', description=description)],
+        transcript_segment_ids=[],
+    )
+    calls = []
+
+    class Model:
+        def invoke(self, messages):
+            calls.append(messages)
+            return SimpleNamespace(content=_minimal_note_payload())
+
+    monkeypatch.setattr(conversation_processing, 'get_llm', Mock(side_effect=lambda *a, **k: Model()))
+    monkeypatch.setattr(conversation_processing, 'shared_conversation_cache_supported', lambda: False)
+    result = conversation_processing.get_conversation_notes(prefix, **_notes_call_kwargs())
+
+    assert bool(calls) is invokes
+    assert bool(result.title) is invokes
+
+
+def test_screen_frames_alone_still_invoke_the_rich_notes_model(monkeypatch):
+    from unittest.mock import Mock
+
+    from utils.llm import conversation_processing
+    from utils.llm.conversation_prompt_context import build_conversation_prompt_prefix
+    from utils.llm.meeting_notes_rich_prompts import NotesFrameImage
+
+    prefix = build_conversation_prompt_prefix(
+        conversation_id='conv-frames',
+        transcript='   ',
+        started_at=datetime(2026, 8, 18, 14, 0, tzinfo=timezone.utc),
+        timezone_name='UTC',
+        language_code='en',
+    )
+    frames = (NotesFrameImage(frame_id='f', offset_label='+02:00', data_url='data:image/jpeg;base64,AAAA'),)
+    calls = []
+
+    class Model:
+        def invoke(self, messages):
+            calls.append(messages)
+            return SimpleNamespace(
+                content=json.dumps(
+                    {
+                        'title': 'Sync',
+                        'overview': 'o',
+                        'emoji': '',
+                        'category': 'work',
+                        'sections': [{'heading': 'Plan', 'body_markdown': '- Decided', 'kind': 'main'}],
+                        'action_items': [],
+                        'events': [],
+                    }
+                )
+            )
+
+    get_llm = Mock(side_effect=lambda *a, **k: Model())
+    monkeypatch.setattr(conversation_processing, 'get_llm', get_llm)
+    monkeypatch.setattr(conversation_processing, 'shared_conversation_cache_supported', lambda: False)
+    conversation_processing.get_conversation_notes(
+        prefix,
+        rich_context_enabled=True,
+        screen_frames=frames,
+        **_notes_call_kwargs(),
+    )
+    assert len(calls) == 1
+
+    conversation_processing.get_conversation_notes(
+        prefix,
+        rich_context_enabled=True,
+        screen_frames=(),
+        **_notes_call_kwargs(),
+    )
+    assert len(calls) == 1
+
+
+def test_bracketed_user_text_counts_as_content_and_is_not_stripped():
+    from utils.llm.conversation_prompt_context import build_conversation_prompt_prefix
+
+    transcript = '[s1 0] then [unrelated-id 9] stays, and [TODO] verbatim'
+    prefix = build_conversation_prompt_prefix(
+        conversation_id='conv-brackets',
+        transcript=transcript,
+        started_at=datetime(2026, 8, 18, 14, 0, tzinfo=timezone.utc),
+        timezone_name='UTC',
+        language_code='en',
+        transcript_segment_ids=['s1'],
+    )
+    assert prefix.has_usable_content is True
+    assert transcript in prefix.context
+
+    foreign = build_conversation_prompt_prefix(
+        conversation_id='conv-foreign',
+        transcript='[s9 0] words the user actually said',
+        started_at=datetime(2026, 8, 18, 14, 0, tzinfo=timezone.utc),
+        timezone_name='UTC',
+        language_code='en',
+        transcript_segment_ids=['s1'],
+    )
+    assert foreign.has_usable_content is True
+
+
+@pytest.mark.parametrize('gateway_enabled', [False, True])
+def test_shared_cache_requires_notes_and_memory_to_use_the_same_model(monkeypatch, gateway_enabled):
+    from utils.llm import conversation_prompt_prefix
+    from utils.llm.model_config import get_model_config
+    from llm_gateway.gateway.config_loader import load_gateway_config
+
+    monkeypatch.setattr(conversation_prompt_prefix, 'should_route_features_through_gateway', lambda: gateway_enabled)
+    if gateway_enabled:
+        routes = load_gateway_config(prod_mode=True).route_artifacts
+        notes = routes['route.conv_structure.model_config.001']
+        memory = routes['route.memory_l1.model_config.001']
+        assert notes.primary.model == memory.primary.model == LUNA_MODEL
+        assert notes.provider_options['reasoning_effort'] == 'low'
+        assert memory.primary.model == LUNA_MODEL
+        assert conversation_prompt_prefix.shared_conversation_cache_supported() is True
+    else:
+        assert get_model_config('conv_structure') == get_model_config('memory_l1')
+        assert conversation_prompt_prefix.shared_conversation_cache_supported() is True

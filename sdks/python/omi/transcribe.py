@@ -1,56 +1,38 @@
-import websockets
-import json
 import asyncio
+from typing import Any, Callable, Optional
+from asyncio import Queue
 
-async def transcribe(audio_queue, api_key):
-    url = "wss://api.deepgram.com/v1/listen?punctuate=true&model=nova&language=en-US&encoding=linear16&sample_rate=16000&channels=1"
-    headers = {
-        "Authorization": f"Token {api_key}"
-    }
+from .stt import SttEngine, create_transcriber
 
-    while True:
-        try:
-            async with websockets.connect(url, extra_headers=headers) as ws:
-                print("Connected to Deepgram WebSocket")
 
-                async def send_audio():
-                    while True:
-                        try:
-                            chunk = await audio_queue.get()
-                            await ws.send(chunk)
-                        except Exception as e:
-                            print(f"Error sending audio: {e}")
-                            break
+async def transcribe(
+    audio_queue: Queue[bytes],
+    api_key: Optional[str] = None,
+    on_transcript: Optional[Callable[[str], None]] = None,
+    *,
+    engine: str = SttEngine.DEEPGRAM.value,
+    **engine_kwargs: Any,
+) -> None:
+    """Real-time transcription. Default engine: Deepgram (legacy).
 
-                async def receive_transcripts():
-                    try:
-                        async for msg in ws:
-                            try:
-                                response = json.loads(msg)
-                                if "error" in response:
-                                    print(f"Deepgram Error: {response['error']}")
-                                    continue
-                                    
-                                # Extract transcript from the response
-                                if "channel" in response and "alternatives" in response["channel"]:
-                                    transcript = response["channel"]["alternatives"][0].get("transcript", "")
-                                    if transcript and transcript.strip():
-                                        print("\nTranscript:", transcript.strip())
-                            except json.JSONDecodeError as e:
-                                print(f"Error decoding response: {e}")
-                            except Exception as e:
-                                print(f"Error processing transcript: {e}")
-                    except websockets.exceptions.ConnectionClosed:
-                        print("Connection to Deepgram closed")
-                    except Exception as e:
-                        print(f"Error in receive_transcripts: {e}")
+    engine:
+      - deepgram (default): requires api_key
+      - parakeet: uses HOSTED_PARAKEET_API_URL or engine_kwargs api_url
+      - whisper: optional local model / injected runner
+    """
+    if callable(api_key) and on_transcript is None:
+        on_transcript = api_key
+        api_key = None
 
-                try:
-                    await asyncio.gather(send_audio(), receive_transcripts())
-                except Exception as e:
-                    print(f"Error in transcribe: {e}")
-                    
-        except Exception as e:
-            print(f"Connection error: {e}")
-            print("Retrying connection in 5 seconds...")
-            await asyncio.sleep(5)
+    if engine == SttEngine.DEEPGRAM.value:
+        key = api_key or engine_kwargs.pop("api_key", None)
+        if not key:
+            raise ValueError("Deepgram api_key is required")
+        transcriber = create_transcriber(engine, api_key=key, **engine_kwargs)
+    elif engine == SttEngine.PARAKEET.value:
+        transcriber = create_transcriber(engine, **engine_kwargs)
+    elif engine == SttEngine.WHISPER.value:
+        transcriber = create_transcriber(engine, **engine_kwargs)
+    else:
+        raise ValueError(f"unknown engine: {engine}")
+    await transcriber.run(audio_queue, on_transcript=on_transcript)

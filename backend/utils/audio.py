@@ -1,81 +1,143 @@
-import wave
+from collections import deque
+from typing import Deque, Optional, Tuple
 
-from pydub import AudioSegment
-from pyogg import OpusDecoder
-
-
-def merge_wav_files(dest_file_path: str, source_files: [str], silent_seconds: [int]):
-    if len(source_files) == 0 or not dest_file_path:
-        return
-
-    combined_sounds = AudioSegment.empty()
-    for i in range(len(source_files)):
-        file_path = source_files[i]
-        sound = AudioSegment.from_wav(file_path)
-        silent_sec = silent_seconds[i]
-        combined_sounds = combined_sounds + sound + AudioSegment.silent(duration=silent_sec)
-    combined_sounds.export(dest_file_path, format="wav")
+# Highest rate /v4/listen admits (utils.transcribe_decisions.SUPPORTED_SAMPLE_RATES). The ring
+# buffer never sizes itself past this rate, so a caller that skips validation cannot make it
+# allocate an unbounded bytearray.
+MAX_RING_BUFFER_SAMPLE_RATE = 48000
 
 
-# frames is 2darray
-def create_wav_from_bytes(
-        file_path: str, frames: [], codec: str, frame_rate: int = 16000, channels: int = 1, sample_width: int = 2
-):
-    # opus
-    if codec == "opus":
-        # Create an Opus decoder
-        opus_decoder = OpusDecoder()
-        opus_decoder.set_channels(channels)
-        opus_decoder.set_sampling_frequency(frame_rate)
+class AudioRingBuffer:
+    """Circular buffer storing last N seconds of PCM16 mono audio.
 
-        wave_write = wave.open(file_path, "wb")
-        # Save the wav's specification
-        wave_write.setnchannels(channels)
-        wave_write.setframerate(frame_rate)
-        wave_write.setsampwidth(sample_width)
+    Positions are tracked with a per-write span ledger: each buffered chunk
+    remembers the wall time of its first sample (``write_positioned``, the
+    audio-timeline v2 path) or its end-of-arrival approximation (``write``,
+    the legacy path), so ``get_time_range``/``extract`` never assume that a
+    long arrival gap means continuous audio.
+    """
 
-        encoded_packets = []
-        for frame in frames:
-            encoded_packets.append(memoryview(bytearray(frame)))
+    def __init__(self, duration_seconds: float, sample_rate: int):
+        self.sample_rate = sample_rate
+        self.bytes_per_second = sample_rate * 2  # PCM16 mono
+        # sample_rate comes from the /v4/listen query param. validate_audio_format restricts it to
+        # standard rates, but this buffer is the allocation an unchecked rate would blow up, so it
+        # also guards itself: a non-positive rate or duration yields a zero capacity (bytearray()
+        # cannot raise "negative count"; mirrors resample_pcm), and an oversized rate is capped at
+        # MAX_RING_BUFFER_SAMPLE_RATE (the buffer then retains fewer seconds rather than OOM the pod).
+        capped_bytes_per_second = min(self.bytes_per_second, MAX_RING_BUFFER_SAMPLE_RATE * 2)
+        self.capacity = max(0, int(duration_seconds * capped_bytes_per_second))
+        self.buffer = bytearray(self.capacity)
+        self.write_pos = 0
+        self.total_bytes_written = 0
+        self.last_write_timestamp: Optional[float] = None
+        # Logical spans of the audio currently retained: (first-sample wall
+        # time, byte count, absolute byte index of the span's first byte),
+        # oldest first. The absolute index locates the span inside the byte
+        # ring (position = absolute % capacity) even after wraparound.
+        self._spans: Deque[Tuple[float, int, int]] = deque()
+        self._buffered_bytes = 0
 
-        for encoded_packet in encoded_packets:
-            decoded_pcm = opus_decoder.decode(encoded_packet)
+    def _append_bytes(self, data: bytes) -> None:
+        n = len(data)
+        copy = min(n, self.capacity)
+        source_offset = n - copy
+        start = (self.write_pos + source_offset) % self.capacity
+        dest = memoryview(self.buffer)
+        source = memoryview(data)[source_offset:]
+        first = min(copy, self.capacity - start)
+        dest[start : start + first] = source[:first]
+        if first < copy:
+            dest[: copy - first] = source[first:]
+        self.write_pos = (self.write_pos + n) % self.capacity
+        self.total_bytes_written += n
 
-            # Save the decoded PCM as a new wav file
-            wave_write.writeframes(decoded_pcm)
+    def _record_span(self, start_ts: float, n_bytes: int) -> None:
+        if n_bytes <= 0:
+            return
+        self._spans.append((start_ts, n_bytes, self.total_bytes_written - n_bytes))
+        self._buffered_bytes += n_bytes
+        excess = self._buffered_bytes - self.capacity
+        while excess > 0 and self._spans:
+            front_ts, front_bytes, front_abs = self._spans[0]
+            if front_bytes > excess:
+                self._spans[0] = (
+                    front_ts + excess / self.bytes_per_second,
+                    front_bytes - excess,
+                    front_abs + excess,
+                )
+                self._buffered_bytes -= excess
+                excess = 0
+            else:
+                self._spans.popleft()
+                self._buffered_bytes -= front_bytes
+                excess -= front_bytes
 
-        wave_write.close()
+    def write(self, data: bytes, timestamp: float):
+        """Append audio data; ``timestamp`` is the chunk's arrival (its end)."""
+        if self.capacity <= 0:
+            # Zero-capacity buffer (non-positive sample_rate/duration): skip rather than IndexError
+            # on buffer[0] or ZeroDivisionError on % capacity when the first audio frame arrives.
+            # last_write_timestamp stays None, so get_time_range()/extract() report nothing buffered
+            # and speaker matching handles that, keeping the live session alive.
+            return
+        self._append_bytes(data)
+        self.last_write_timestamp = timestamp
+        self._record_span(timestamp - len(data) / self.bytes_per_second, len(data))
 
-        return
+    def write_positioned(self, data: bytes, start_ts: float):
+        """Append audio whose first sample is at ``start_ts`` (capture projection)."""
+        if self.capacity <= 0:
+            return
+        self._append_bytes(data)
+        self.last_write_timestamp = start_ts + len(data) / self.bytes_per_second
+        self._record_span(start_ts, len(data))
 
-    # pcm16
-    if codec == "pcm16":
-        wave_write = wave.open(file_path, "wb")
-        # Save the wav's specification
-        wave_write.setnchannels(channels)
-        wave_write.setframerate(frame_rate)
-        wave_write.setsampwidth(sample_width)
+    def get_time_range(self) -> Optional[Tuple[float, float]]:
+        """Return (start_ts, end_ts) of audio currently in buffer."""
+        if not self._spans:
+            return None
+        front_ts, _, _ = self._spans[0]
+        back_ts, back_bytes, _ = self._spans[-1]
+        return (front_ts, back_ts + back_bytes / self.bytes_per_second)
 
-        for frame in frames:
-            decoded_pcm = frame
-            wave_write.writeframes(decoded_pcm)
+    def extract(self, start_ts: float, end_ts: float) -> Optional[bytes]:
+        """Extract the audio overlapping ``[start_ts, end_ts)`` by walking the span ledger.
 
-        wave_write.close()
-        return
-
-    # pcm8
-    if codec == "pcm8":
-        wave_write = wave.open(file_path, "wb")
-        # Save the wav's specification
-        wave_write.setnchannels(channels)
-        wave_write.setframerate(frame_rate)
-        wave_write.setsampwidth(sample_width)
-
-        for frame in frames:
-            decoded_pcm = frame
-            wave_write.writeframes(decoded_pcm)
-
-        wave_write.close()
-        return
-
-    raise Exception(f"codec {codec} is not supported")
+        Bytes are copied span by span, so a wall-clock arrival gap inside the
+        window is skipped rather than misread as continuous audio: the byte
+        ring holds only the bytes actually written, never the silence of a
+        client stall, and a window crossing a stall must not translate the
+        whole wall delta into one byte offset.
+        """
+        if not self._spans:
+            return None
+        result = bytearray()
+        for span_start_ts, n_bytes, start_abs in self._spans:
+            span_end_ts = span_start_ts + n_bytes / self.bytes_per_second
+            lo = max(start_ts, span_start_ts)
+            hi = min(end_ts, span_end_ts)
+            if hi <= lo:
+                continue
+            lo_off = int((lo - span_start_ts) * self.bytes_per_second)
+            hi_off = int((hi - span_start_ts) * self.bytes_per_second)
+            # Align the start to the PCM16 2-byte sample boundary. lo is an
+            # arbitrary float timestamp, so lo_off is odd roughly half the
+            # time; an odd offset begins the copy on a sample's high byte and
+            # byte-shifts every int16 sample into noise. Flooring to an even
+            # offset is what keeps whole samples intact.
+            lo_off -= lo_off % 2
+            # Ensure even number of bytes (PCM16)
+            length = ((hi_off - lo_off) // 2) * 2
+            if length <= 0:
+                continue
+            src = (start_abs + lo_off) % self.capacity
+            if src + length <= self.capacity:
+                result += self.buffer[src : src + length]
+            else:
+                first = self.capacity - src
+                result += self.buffer[src:]
+                result += self.buffer[: length - first]
+        if not result:
+            return None
+        return bytes(result)

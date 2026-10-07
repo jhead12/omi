@@ -1,39 +1,88 @@
-import { Memory as MemoryType } from '@/src/types/memory.types';
-import moment from 'moment';
+import { Memory as MemoryType, SharedScreenshotsResult } from '@/src/types/memory.types';
 import { SearchParamsTypes } from '@/src/types/params.types';
 import { DEFAULT_TITLE_MEMORY } from '@/src/constants/memory';
+import {
+  avatarToneIndex,
+  durationMinutes,
+  formatDuration,
+  meetingTypeLabel,
+  participantFacts,
+  participantInitials,
+  shareDateTime,
+  sortParticipants,
+} from '@/src/lib/shared-note.mjs';
 import MemoryWithTabs from './summary/memory-with-tabs';
+import { Fragment } from 'react';
 
 interface MemoryProps {
   memory: MemoryType;
   searchParams: SearchParamsTypes;
+  screenshots?: SharedScreenshotsResult | null;
 }
 
-export default function Memory({ memory, searchParams }: MemoryProps) {
-  const currentTab = searchParams.tab ?? 'sum';
+export default function Memory({ memory, screenshots = null }: MemoryProps) {
+  const title = memory.structured?.title || DEFAULT_TITLE_MEMORY;
+  const stamp = shareDateTime(memory);
+  const minutes = durationMinutes(memory.started_at, memory.finished_at);
+  const duration = formatDuration(minutes);
+  const typeLabel = meetingTypeLabel(memory.structured?.meeting_type);
+  const participants = sortParticipants(memory.structured?.participants);
+  const metaItems = [
+    stamp ? (
+      <time key="time" dateTime={stamp.iso}>
+        {stamp.label}
+      </time>
+    ) : null,
+    duration ? <span key="duration">{duration}</span> : null,
+    typeLabel ? <span key="type">{typeLabel}</span> : null,
+  ].filter(Boolean);
+
   return (
-    <div className="relative rounded-2xl border border-solid border-zinc-800 pb-6 text-white shadow-md shadow-gray-900 backdrop-blur-lg md:mx-auto md:pb-12 bg-bg-color">
-      <div className="relative overflow-hidden py-6 md:pt-12">
-        <div className="relative z-50">
-          <div className="px-4 md:px-12">
-            <h2 className="text-2xl font-bold md:text-3xl">
-              {memory.structured.title || DEFAULT_TITLE_MEMORY}
-            </h2>
-            <p className="my-2 text-sm text-gray-500 md:text-base">
-              {moment(memory.created_at).format('MMMM Do YYYY, h:mm:ss a')}
-            </p>
-            <span className="rounded-full bg-gray-700 px-3 py-1.5 text-xs md:text-sm">
-              {memory.structured.emoji}{' '}
-              {memory.structured.category.charAt(0).toUpperCase() +
-                memory.structured.category.slice(1)}
-            </span>
+    <div>
+      {/* Content */}
+      <div>
+        <h1 className="sn-title">{title}</h1>
+        {metaItems.length > 0 && (
+          <div className="sn-meta">
+            {metaItems.map((item, index) => (
+              <Fragment key={index}>
+                {index > 0 && (
+                  <span className="sn-meta-sep" aria-hidden="true">
+                    ·
+                  </span>
+                )}
+                {item}
+              </Fragment>
+            ))}
           </div>
-          <MemoryWithTabs memory={memory} />
-        </div>
-        <div className="absolute top-0 z-10 h-full w-full  select-none blur-3xl">
-          <div className="absolute right-[0rem] top-[-70px] h-[10rem] w-[100%] bg-[#1758e74f] opacity-30" />
-        </div>
+        )}
+        {participants.length > 0 && (
+          <ul className="sn-participants" aria-label="Participants">
+            {participants.map((participant, index) => {
+              const { name, details } = participantFacts(participant);
+              const role = details.join(' · ');
+              return (
+                <li key={index} className="sn-chip" title={role || undefined}>
+                  <span
+                    className={`sn-avatar sn-avatar-${avatarToneIndex(name)}`}
+                    aria-hidden="true"
+                  >
+                    {participantInitials(name)}
+                  </span>
+                  <span className="sn-chip-text">
+                    <span className="sn-chip-name">
+                      {name}
+                      {participant.is_ai_agent ? <span className="sn-ai">AI</span> : null}
+                    </span>
+                    {role ? <span className="sn-chip-role">{role}</span> : null}
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
+        )}
       </div>
+      <MemoryWithTabs memory={memory} screenshots={screenshots} />
     </div>
   );
 }
